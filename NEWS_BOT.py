@@ -633,14 +633,27 @@ Rules:
         }
     }
 
-    try:
-        r = _session.post(url, headers=headers, json=body, timeout=(10, 30))
-    except Exception as e:
-        log.warning(f"[GEMINI] request failed: {type(e).__name__}: {e}")
-        return None
+    # Retry on rate limit (Gemini free tier: 10 RPM for 2.5-flash)
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            r = _session.post(url, headers=headers, json=body, timeout=(10, 30))
+        except Exception as e:
+            log.warning(f"[GEMINI] request failed: {type(e).__name__}: {e}")
+            return None
 
-    if r.status_code != 200:
-        log.warning(f"[GEMINI] HTTP {r.status_code}: {r.text[:120]}")
+        if r.status_code == 200:
+            break  # success
+        elif r.status_code == 429:
+            wait = 5 * (attempt + 1)  # 5s, 10s, 15s
+            log.info(f"[GEMINI] rate limit, waiting {wait}s (attempt {attempt+1}/{max_attempts})")
+            time.sleep(wait)
+            continue
+        else:
+            log.warning(f"[GEMINI] HTTP {r.status_code}: {r.text[:120]}")
+            return None
+    else:
+        log.warning(f"[GEMINI] all {max_attempts} attempts hit rate limit")
         return None
 
     # Extract text from response
@@ -1001,7 +1014,10 @@ def enrich_with_ai(articles: List[Dict],
     Run AI analysis on relevant articles using Council pattern.
 
     Phase 1 (always): Gemini analyzes all candidates
-    Phase 2 (council): Claude + OpenAI for important ones
+    Phase 2 (council): Claude + OpenAI for important ones (limited!)
+
+    NOTE: Council in pipeline is conservative (saves quota).
+    For full council on a specific article, use /council command.
     """
     candidates = [a for a in articles if should_analyze(a)]
     candidates = candidates[:max_to_analyze]
@@ -1009,30 +1025,36 @@ def enrich_with_ai(articles: List[Dict],
     log.info(f"[AI] Phase 1 (Gemini): {len(candidates)} articles...")
 
     # Phase 1: Gemini for all candidates
+    gemini_success = 0
     for a in candidates:
         try:
             ai = gemini_analyze(a)
             if ai:
                 a["ai"] = ai
-            time.sleep(0.3)
+                gemini_success += 1
+            time.sleep(0.5)  # Increased from 0.3 to avoid rate limit
         except Exception as e:
             log.warning(f"[AI] {a.get('title','?')[:40]}: {e}")
 
-    # Phase 2: Council escalation (only if enabled)
+    log.info(f"[AI] Gemini: {gemini_success}/{len(candidates)} succeeded")
+
+    # Phase 2: Conservative council escalation
+    # Only for the SINGLE highest-priority article (saves cost+time)
     if enable_council:
-        # Determine which articles need deeper analysis
-        deep_targets = []
         council_targets = []
+        deep_targets = []
         for a in candidates:
+            if not a.get("ai"):
+                continue
             tier = determine_tier(a)
             if tier == "council":
                 council_targets.append(a)
             elif tier == "deep":
                 deep_targets.append(a)
 
-        # Limit to avoid burning quota — top 3 council, top 5 deep
-        council_targets = council_targets[:3]
-        deep_targets = deep_targets[:5]
+        # CONSERVATIVE: only top 1 council, top 2 deep (saves quota for /council manual)
+        council_targets = council_targets[:1]
+        deep_targets = deep_targets[:2]
 
         if council_targets:
             log.info(f"[AI] Phase 2a (Council): {len(council_targets)} articles")
@@ -1042,7 +1064,7 @@ def enrich_with_ai(articles: List[Dict],
                         clde = claude_analyze(a)
                         if clde:
                             a["claude"] = clde
-                        time.sleep(0.3)
+                        time.sleep(0.5)
                     if OPENAI_API_KEY:
                         oai = openai_analyze(a)
                         if oai:
@@ -2174,15 +2196,35 @@ async def cmd_council(u: Update, c: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-    # Load fresh news
     loop = asyncio.get_event_loop()
-    articles = await loop.run_in_executor(None, run_news_pipeline, True)
+
+    # Try cached snapshot first (much faster!)
+    snapshot = storage_load("news_latest.json", {})
+    articles = snapshot.get("articles", [])
+
+    # Check if snapshot is fresh (less than 1 hour old) and has AI analysis
+    snap_age_minutes = 999
+    if snapshot.get("timestamp"):
+        try:
+            snap_dt = datetime.fromisoformat(snapshot["timestamp"])
+            snap_age_minutes = (datetime.now(TZ_RIYADH) - snap_dt).total_seconds() / 60
+        except Exception:
+            pass
+
+    has_ai = any(a.get("ai") for a in articles)
+
+    # Refetch if no articles, no AI, or older than 60 min
+    if not articles or not has_ai or snap_age_minutes > 60:
+        log.info(f"[COUNCIL] refreshing (age={snap_age_minutes:.0f}min, has_ai={has_ai})")
+        articles = await loop.run_in_executor(None, run_news_pipeline, True)
+    else:
+        log.info(f"[COUNCIL] using cached articles (age={snap_age_minutes:.0f}min)")
 
     # Filter by coin if specified
     if filter_coin:
         articles = [a for a in articles if filter_coin in a.get("coins", [])]
 
-    # Find highest-priority article
+    # Find highest-priority article (must have AI analysis already)
     candidates = [
         a for a in articles
         if a.get("ai", {}).get("impact") == "high"
@@ -2190,7 +2232,7 @@ async def cmd_council(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not candidates:
         candidates = [
             a for a in articles
-            if a.get("is_portfolio_relevant", False)
+            if a.get("is_portfolio_relevant", False) and a.get("ai")
         ]
     if not candidates:
         candidates = [
@@ -2209,14 +2251,45 @@ async def cmd_council(u: Update, c: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Pick most recent high-impact
     target = candidates[0]
 
-    # Run full council
-    def _run_council():
-        return council_analyze(target, tier="council")
+    # Update progress message
+    try:
+        await msg.edit_text(
+            f"🤝 *Council يحلل:*\n"
+            f"_{target.get('title', '')[:80]}_\n\n"
+            "🟣 Claude يفكر...",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
 
-    target = await loop.run_in_executor(None, _run_council)
+    # Run Claude
+    def _run_claude():
+        return claude_analyze(target)
+
+    clde = await loop.run_in_executor(None, _run_claude)
+    if clde:
+        target["claude"] = clde
+
+    # Update progress
+    try:
+        await msg.edit_text(
+            f"🤝 *Council يحلل:*\n"
+            f"_{target.get('title', '')[:80]}_\n\n"
+            "🔵 GPT-4o يكتب التوصية...",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    # Run OpenAI
+    def _run_openai():
+        return openai_analyze(target)
+
+    oai = await loop.run_in_executor(None, _run_openai)
+    if oai:
+        target["openai"] = oai
 
     # Save updated article
     snap = storage_load("news_latest.json", {})
