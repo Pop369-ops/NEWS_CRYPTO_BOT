@@ -994,7 +994,7 @@ def determine_tier(article: Dict) -> str:
     return "fast"
 
 
-
+def should_analyze(article: Dict) -> bool:
     """
     Decide if article deserves Gemini analysis (saves quota).
     Strategy: only analyze if relevant to portfolio OR has coin mentions.
