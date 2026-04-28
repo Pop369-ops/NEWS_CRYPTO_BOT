@@ -62,18 +62,9 @@ DCA_DATA_DIR = os.environ.get("DCA_DATA_DIR", "/data").rstrip("/")
 # ── API Endpoints ──
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
-# Same approach as CRYPTO_SCANNER_BOT (proven working).
-# gemini-2.5-flash is the latest stable model on v1beta API.
+# Single primary model — proven working in CRYPTO_SCANNER_BOT.
+# If Google deprecates this, use /gemdebug to find a replacement.
 GEMINI_MODEL = "gemini-2.5-flash"
-
-# Backup models in case primary becomes unavailable in future.
-# Updated April 2026 based on actual key availability.
-GEMINI_FALLBACKS = [
-    "gemini-2.5-pro",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-]
-_active_gemini_model: Optional[str] = None  # set on first success
 
 RSS_FEEDS = {
     "CoinDesk":      "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -589,18 +580,39 @@ def filter_by_portfolio(articles: List[Dict],
 # 6. GEMINI AI ANALYZER
 # ══════════════════════════════════════════════════════════════════
 
-def _try_gemini_model(model_name: str, prompt: str) -> Optional[Tuple[Optional[Dict], str]]:
+def gemini_analyze(article: Dict) -> Optional[Dict]:
     """
-    Try one specific Gemini model. Returns (result, error_msg).
-    result is None if failed, error_msg explains why.
+    Analyze article with Gemini. Simple, robust, scanner_bot-style.
+    Returns: {sentiment, impact, reasoning_ar, summary_ar, action_hint} or None
     """
-    url = f"{GEMINI_BASE}/models/{model_name}:generateContent"
+    if not GEMINI_API_KEY:
+        return None
+
+    title = article.get("title", "")
+    summary = article.get("summary", "")[:300]
+    coins = article.get("coins", [])
+    coins_str = ", ".join(coins) if coins else "general crypto market"
+
+    prompt = f"""Analyze this crypto news. Reply with ONLY a JSON object (no markdown, no code fences, no extra text):
+
+TITLE: {title}
+SUMMARY: {summary}
+COINS: {coins_str}
+
+JSON format:
+{{"sentiment":"bullish OR bearish OR neutral","impact":"high OR medium OR low","reasoning_ar":"3 short Arabic sentences","summary_ar":"1-2 Arabic sentences summary","action_hint":"1 short Arabic suggestion"}}
+
+Rules:
+- impact=high if news could move price 5%+ in 24h
+- impact=medium for partnerships/tech updates
+- impact=low for minor news
+- sentiment from crypto market perspective"""
+
+    url = f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent"
     headers = {
         "Content-Type": "application/json",
         "x-goog-api-key": GEMINI_API_KEY,
     }
-    # Note: responseMimeType removed — caused inconsistencies with v1beta API.
-    # We extract JSON from text response instead (more robust).
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -610,173 +622,54 @@ def _try_gemini_model(model_name: str, prompt: str) -> Optional[Tuple[Optional[D
     }
 
     try:
-        r = _session.post(url, headers=headers, json=body,
-                          timeout=(10, GEMINI_TIMEOUT))
-        if r.status_code == 200:
-            data = r.json()
-            candidates = data.get("candidates", [])
-            if not candidates:
-                return None, "no candidates returned"
-            parts = candidates[0].get("content", {}).get("parts", [])
-            if not parts:
-                return None, "no parts in response"
-            text = parts[0].get("text", "").strip()
-
-            # Robust JSON extraction (handles markdown code fences, prefixes, etc.)
-            result = _extract_json_from_text(text)
-            if result and "sentiment" in result and "impact" in result:
-                return result, "ok"
-            if not result:
-                return None, f"no JSON found in: {text[:60]}"
-            return None, "missing required fields"
-        elif r.status_code == 404:
-            return None, f"model not found (404)"
-        elif r.status_code in (401, 403):
-            return None, f"auth error ({r.status_code})"
-        elif r.status_code == 429:
-            return None, "rate limit (429)"
-        else:
-            err_text = (r.text or "")[:120]
-            return None, f"HTTP {r.status_code}: {err_text}"
-    except requests.exceptions.Timeout:
-        return None, "timeout"
+        r = _session.post(url, headers=headers, json=body, timeout=(10, 30))
     except Exception as e:
-        return None, f"{type(e).__name__}: {str(e)[:80]}"
-
-
-def _extract_json_from_text(text: str) -> Optional[Dict]:
-    """
-    Robustly extract JSON object from Gemini response text.
-    Handles: markdown fences, prefixes, multi-line, trailing text.
-    """
-    if not text:
+        log.warning(f"[GEMINI] request failed: {type(e).__name__}: {e}")
         return None
 
-    # Strategy 1: Strip markdown code fences and try
-    cleaned = re.sub(r"^```(?:json)?\s*", "", text.strip())
-    cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+    if r.status_code != 200:
+        log.warning(f"[GEMINI] HTTP {r.status_code}: {r.text[:120]}")
+        return None
+
+    # Extract text from response
     try:
-        return json.loads(cleaned)
+        data = r.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except (KeyError, IndexError, ValueError) as e:
+        log.warning(f"[GEMINI] response parse: {e}")
+        return None
+
+    # Strip code fences (Gemini often adds them despite instructions)
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```\s*$", "", text)
+    text = text.strip()
+
+    # Try direct JSON parse
+    parsed = None
+    try:
+        parsed = json.loads(text)
     except json.JSONDecodeError:
-        pass
+        # Fallback: find first {...} block
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                log.warning(f"[GEMINI] JSON unparseable: {text[:80]}")
+                return None
 
-    # Strategy 2: Find first balanced {...} block
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for i in range(start, len(text)):
-        c = text[i]
-        if escape:
-            escape = False
-            continue
-        if c == "\\":
-            escape = True
-            continue
-        if c == '"' and not escape:
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = text[start:i+1]
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    return None
-    return None
-
-
-def gemini_analyze(article: Dict) -> Optional[Dict]:
-    """
-    Send article to Gemini for analysis. Mirrors CRYPTO_SCANNER_BOT pattern.
-    Tries primary model first, falls back to alternatives only on failure.
-    Returns: {sentiment, impact, reasoning_ar, summary_ar, action_hint}
-    """
-    global _active_gemini_model
-
-    if not GEMINI_API_KEY:
+    if not parsed or "sentiment" not in parsed or "impact" not in parsed:
+        log.warning(f"[GEMINI] missing fields: {text[:80]}")
         return None
 
-    title = article.get("title", "")
-    summary = article.get("summary", "")
-    coins = article.get("coins", [])
-
-    prompt = f"""You are a crypto market analyst. Analyze this news and respond in JSON only.
-
-TITLE: {title}
-SUMMARY: {summary[:300]}
-COINS_MENTIONED: {', '.join(coins) if coins else 'general market'}
-
-Respond with EXACTLY this JSON structure (no markdown, no extra text):
-{{
-  "sentiment": "bullish" | "bearish" | "neutral",
-  "impact": "high" | "medium" | "low",
-  "reasoning_ar": "3 short Arabic sentences explaining why",
-  "summary_ar": "1-2 sentence Arabic summary of the news",
-  "action_hint": "1 short Arabic suggestion (e.g. 'راقب BTC' or 'لا حاجة للقلق')"
-}}
-
-Rules:
-- IMPACT high = could move price 5%+ within 24h (regulations, ETFs, hacks, major adoption)
-- IMPACT medium = notable but limited price impact (partnerships, tech updates)
-- IMPACT low = minor news (small projects, opinions, predictions)
-- SENTIMENT relative to crypto market: bullish=positive, bearish=negative
-- All Arabic text should be clear and concise
-- DO NOT include markdown code fences or any text outside the JSON"""
-
-    # Use cached working model first (after first success)
-    if _active_gemini_model:
-        result, err = _try_gemini_model(_active_gemini_model, prompt)
-        if result:
-            return _normalize_gemini_result(result)
-        # Cached model stopped working — clear and try alternatives
-        log.warning(f"[GEMINI] cached {_active_gemini_model} failed: {err}")
-        _active_gemini_model = None
-
-    # First attempt: primary model (matches scanner_bot)
-    result, err = _try_gemini_model(GEMINI_MODEL, prompt)
-    if result:
-        _active_gemini_model = GEMINI_MODEL
-        log.info(f"[GEMINI] using primary model: {GEMINI_MODEL}")
-        return _normalize_gemini_result(result)
-
-    # Hard auth failures: stop immediately, fallbacks won't help
-    if "auth error" in err or "API key not valid" in err.lower():
-        log.warning(f"[GEMINI] auth error — stopping: {err}")
-        return None
-
-    log.warning(f"[GEMINI] primary {GEMINI_MODEL} failed: {err}, trying fallbacks")
-
-    # Fallback chain
-    for model in GEMINI_FALLBACKS:
-        result, err = _try_gemini_model(model, prompt)
-        if result:
-            _active_gemini_model = model
-            log.info(f"[GEMINI] fell back to: {model}")
-            return _normalize_gemini_result(result)
-        if "auth error" in err:
-            break
-
-    log.warning(f"[GEMINI] all models failed. last err: {err}")
-    return None
-
-
-def _normalize_gemini_result(result: Dict) -> Dict:
-    """Standardize Gemini response fields."""
     return {
-        "sentiment":     str(result.get("sentiment", "neutral")).lower(),
-        "impact":        str(result.get("impact", "low")).lower(),
-        "reasoning_ar":  result.get("reasoning_ar", ""),
-        "summary_ar":    result.get("summary_ar", ""),
-        "action_hint":   result.get("action_hint", ""),
+        "sentiment":    str(parsed.get("sentiment", "neutral")).lower(),
+        "impact":       str(parsed.get("impact", "low")).lower(),
+        "reasoning_ar": parsed.get("reasoning_ar", ""),
+        "summary_ar":   parsed.get("summary_ar", ""),
+        "action_hint":  parsed.get("action_hint", ""),
     }
+
 
 
 def should_analyze(article: Dict) -> bool:
@@ -1204,7 +1097,7 @@ def run_connectivity_test() -> Dict[str, Any]:
             results["Gemini"] = {
                 "ok": ai is not None,
                 "elapsed_ms": elapsed,
-                "model": _active_gemini_model or "(none worked)",
+                "model": GEMINI_MODEL,
             }
             if ai:
                 results["Gemini"]["sample_sentiment"] = ai.get("sentiment", "?")
@@ -1390,8 +1283,9 @@ COINS: BTC
 
 Respond with: {"sentiment": "bullish", "impact": "high"}"""
 
-        # Test primary + fallback models
-        models_to_test = [GEMINI_MODEL] + GEMINI_FALLBACKS
+        # Test primary + common alternatives
+        models_to_test = [GEMINI_MODEL, "gemini-2.5-pro", "gemini-2.0-flash-001",
+                          "gemini-2.0-flash-lite-001"]
         for model in models_to_test:
             url = f"{GEMINI_BASE}/models/{model}:generateContent"
             headers = {
@@ -1856,8 +1750,7 @@ def _print_banner():
     print("=" * 70)
     print(f"  AI Engine        :")
     print(f"    🤖 Gemini      : {gem_status}")
-    print(f"    Primary        : {GEMINI_MODEL}")
-    print(f"    Fallbacks      : {len(GEMINI_FALLBACKS)} alternatives")
+    print(f"    Model          : {GEMINI_MODEL}")
     print(f"  المصادر         :")
     print(f"    📡 CoinDesk    : RSS")
     print(f"    📡 The Block   : RSS")
