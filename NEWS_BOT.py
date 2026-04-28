@@ -599,16 +599,16 @@ def _try_gemini_model(model_name: str, prompt: str) -> Optional[Tuple[Optional[D
         "Content-Type": "application/json",
         "x-goog-api-key": GEMINI_API_KEY,
     }
+    # Note: responseMimeType removed — caused inconsistencies with v1beta API.
+    # We extract JSON from text response instead (more robust).
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.3,
-            "maxOutputTokens": 500,
-            "responseMimeType": "application/json",
+            "maxOutputTokens": 800,
         }
     }
 
-    # Direct request to capture exact error
     try:
         r = _session.post(url, headers=headers, json=body,
                           timeout=(10, GEMINI_TIMEOUT))
@@ -621,15 +621,14 @@ def _try_gemini_model(model_name: str, prompt: str) -> Optional[Tuple[Optional[D
             if not parts:
                 return None, "no parts in response"
             text = parts[0].get("text", "").strip()
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
-            try:
-                result = json.loads(text)
-                if "sentiment" in result and "impact" in result:
-                    return result, "ok"
-                return None, "missing required fields"
-            except json.JSONDecodeError as e:
-                return None, f"JSON parse: {e}"
+
+            # Robust JSON extraction (handles markdown code fences, prefixes, etc.)
+            result = _extract_json_from_text(text)
+            if result and "sentiment" in result and "impact" in result:
+                return result, "ok"
+            if not result:
+                return None, f"no JSON found in: {text[:60]}"
+            return None, "missing required fields"
         elif r.status_code == 404:
             return None, f"model not found (404)"
         elif r.status_code in (401, 403):
@@ -643,6 +642,55 @@ def _try_gemini_model(model_name: str, prompt: str) -> Optional[Tuple[Optional[D
         return None, "timeout"
     except Exception as e:
         return None, f"{type(e).__name__}: {str(e)[:80]}"
+
+
+def _extract_json_from_text(text: str) -> Optional[Dict]:
+    """
+    Robustly extract JSON object from Gemini response text.
+    Handles: markdown fences, prefixes, multi-line, trailing text.
+    """
+    if not text:
+        return None
+
+    # Strategy 1: Strip markdown code fences and try
+    cleaned = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: Find first balanced {...} block
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if escape:
+            escape = False
+            continue
+        if c == "\\":
+            escape = True
+            continue
+        if c == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start:i+1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    return None
+    return None
 
 
 def gemini_analyze(article: Dict) -> Optional[Dict]:
