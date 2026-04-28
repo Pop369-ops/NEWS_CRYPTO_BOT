@@ -62,14 +62,16 @@ DCA_DATA_DIR = os.environ.get("DCA_DATA_DIR", "/data").rstrip("/")
 # ── API Endpoints ──
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
-# Models tried in order — first one that works is cached.
-# Updated based on actual availability (April 2026).
-GEMINI_MODELS = [
-    "gemini-2.5-flash",         # ⭐ latest + fastest (preferred)
-    "gemini-2.0-flash-001",     # versioned 2.0 (stable)
-    "gemini-2.0-flash-lite",    # cheaper alternative
-    "gemini-2.5-pro",           # higher quality fallback
-    "gemini-2.0-flash-lite-001",
+# Same approach as CRYPTO_SCANNER_BOT (proven working).
+# gemini-2.5-flash is the latest stable model on v1beta API.
+GEMINI_MODEL = "gemini-2.5-flash"
+
+# Backup models in case primary becomes unavailable in future.
+# Updated April 2026 based on actual key availability.
+GEMINI_FALLBACKS = [
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
 ]
 _active_gemini_model: Optional[str] = None  # set on first success
 
@@ -645,7 +647,8 @@ def _try_gemini_model(model_name: str, prompt: str) -> Optional[Tuple[Optional[D
 
 def gemini_analyze(article: Dict) -> Optional[Dict]:
     """
-    Send article to Gemini for analysis. Tries multiple models with fallback.
+    Send article to Gemini for analysis. Mirrors CRYPTO_SCANNER_BOT pattern.
+    Tries primary model first, falls back to alternatives only on failure.
     Returns: {sentiment, impact, reasoning_ar, summary_ar, action_hint}
     """
     global _active_gemini_model
@@ -680,47 +683,52 @@ Rules:
 - All Arabic text should be clear and concise
 - DO NOT include markdown code fences or any text outside the JSON"""
 
-    # Try cached working model first
+    # Use cached working model first (after first success)
     if _active_gemini_model:
         result, err = _try_gemini_model(_active_gemini_model, prompt)
         if result:
-            return {
-                "sentiment":     result.get("sentiment", "neutral").lower(),
-                "impact":        result.get("impact", "low").lower(),
-                "reasoning_ar":  result.get("reasoning_ar", ""),
-                "summary_ar":    result.get("summary_ar", ""),
-                "action_hint":   result.get("action_hint", ""),
-            }
-        # If cached model fails with auth/rate, don't try others
-        if "auth error" in err or "rate limit" in err:
-            log.warning(f"[GEMINI] {_active_gemini_model}: {err}")
-            return None
-        # Else, model became unavailable — clear cache and try fallback
-        log.warning(f"[GEMINI] {_active_gemini_model} failed: {err}, trying fallback")
+            return _normalize_gemini_result(result)
+        # Cached model stopped working — clear and try alternatives
+        log.warning(f"[GEMINI] cached {_active_gemini_model} failed: {err}")
         _active_gemini_model = None
 
-    # Try each model in order
-    last_err = "no models tried"
-    for model in GEMINI_MODELS:
+    # First attempt: primary model (matches scanner_bot)
+    result, err = _try_gemini_model(GEMINI_MODEL, prompt)
+    if result:
+        _active_gemini_model = GEMINI_MODEL
+        log.info(f"[GEMINI] using primary model: {GEMINI_MODEL}")
+        return _normalize_gemini_result(result)
+
+    # Hard auth failures: stop immediately, fallbacks won't help
+    if "auth error" in err or "API key not valid" in err.lower():
+        log.warning(f"[GEMINI] auth error — stopping: {err}")
+        return None
+
+    log.warning(f"[GEMINI] primary {GEMINI_MODEL} failed: {err}, trying fallbacks")
+
+    # Fallback chain
+    for model in GEMINI_FALLBACKS:
         result, err = _try_gemini_model(model, prompt)
         if result:
             _active_gemini_model = model
-            log.info(f"[GEMINI] using model: {model}")
-            return {
-                "sentiment":     result.get("sentiment", "neutral").lower(),
-                "impact":        result.get("impact", "low").lower(),
-                "reasoning_ar":  result.get("reasoning_ar", ""),
-                "summary_ar":    result.get("summary_ar", ""),
-                "action_hint":   result.get("action_hint", ""),
-            }
-        last_err = f"{model}: {err}"
-        # If auth error, all models will fail — stop
+            log.info(f"[GEMINI] fell back to: {model}")
+            return _normalize_gemini_result(result)
         if "auth error" in err:
-            log.warning(f"[GEMINI] auth error — stopping all model attempts")
             break
 
-    log.warning(f"[GEMINI] all models failed. last: {last_err}")
+    log.warning(f"[GEMINI] all models failed. last err: {err}")
     return None
+
+
+def _normalize_gemini_result(result: Dict) -> Dict:
+    """Standardize Gemini response fields."""
+    return {
+        "sentiment":     str(result.get("sentiment", "neutral")).lower(),
+        "impact":        str(result.get("impact", "low")).lower(),
+        "reasoning_ar":  result.get("reasoning_ar", ""),
+        "summary_ar":    result.get("summary_ar", ""),
+        "action_hint":   result.get("action_hint", ""),
+    }
 
 
 def should_analyze(article: Dict) -> bool:
@@ -1334,8 +1342,9 @@ COINS: BTC
 
 Respond with: {"sentiment": "bullish", "impact": "high"}"""
 
-        # Test each model
-        for model in GEMINI_MODELS:
+        # Test primary + fallback models
+        models_to_test = [GEMINI_MODEL] + GEMINI_FALLBACKS
+        for model in models_to_test:
             url = f"{GEMINI_BASE}/models/{model}:generateContent"
             headers = {
                 "Content-Type": "application/json",
@@ -1799,8 +1808,8 @@ def _print_banner():
     print("=" * 70)
     print(f"  AI Engine        :")
     print(f"    🤖 Gemini      : {gem_status}")
-    print(f"    Models         : {len(GEMINI_MODELS)} fallbacks")
-    print(f"      → {GEMINI_MODELS[0]} (preferred)")
+    print(f"    Primary        : {GEMINI_MODEL}")
+    print(f"    Fallbacks      : {len(GEMINI_FALLBACKS)} alternatives")
     print(f"  المصادر         :")
     print(f"    📡 CoinDesk    : RSS")
     print(f"    📡 The Block   : RSS")
