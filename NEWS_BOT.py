@@ -62,13 +62,14 @@ DCA_DATA_DIR = os.environ.get("DCA_DATA_DIR", "/data").rstrip("/")
 # ── API Endpoints ──
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
-# Try models in order; first one that works wins. Cached in memory.
+# Models tried in order — first one that works is cached.
+# Updated based on actual availability (April 2026).
 GEMINI_MODELS = [
-    "gemini-2.0-flash",       # widely available, free tier
-    "gemini-2.0-flash-exp",   # experimental (sometimes free)
-    "gemini-1.5-flash",       # legacy fallback
-    "gemini-1.5-flash-latest",
-    "gemini-pro",             # last resort
+    "gemini-2.5-flash",         # ⭐ latest + fastest (preferred)
+    "gemini-2.0-flash-001",     # versioned 2.0 (stable)
+    "gemini-2.0-flash-lite",    # cheaper alternative
+    "gemini-2.5-pro",           # higher quality fallback
+    "gemini-2.0-flash-lite-001",
 ]
 _active_gemini_model: Optional[str] = None  # set on first success
 
