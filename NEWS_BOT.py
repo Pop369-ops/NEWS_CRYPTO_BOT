@@ -79,9 +79,16 @@ OPENAI_MODEL = "gpt-4o"                     # primary
 OPENAI_FALLBACK = "gpt-4o-mini"             # cheaper fallback
 
 RSS_FEEDS = {
-    "CoinDesk":      "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "The Block":     "https://www.theblock.co/rss.xml",
-    "CoinTelegraph": "https://cointelegraph.com/rss",
+    # Core (proven working)
+    "CoinDesk":         "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "The Block":        "https://www.theblock.co/rss.xml",
+    "CoinTelegraph":    "https://cointelegraph.com/rss",
+    # New additions (free, high-quality)
+    "Decrypt":          "https://decrypt.co/feed",
+    "BitcoinMagazine":  "https://bitcoinmagazine.com/.rss/full/",
+    "CryptoBriefing":   "https://cryptobriefing.com/feed/",
+    "U.Today":          "https://u.today/rss",
+    "Bitcoinist":       "https://bitcoinist.com/feed/",
 }
 
 COINGECKO_NEWS_URL  = "https://api.coingecko.com/api/v3/news"
@@ -2038,9 +2045,10 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "🟢 Gemini — العين السريعة\n"
         "🟣 Claude — المحلل الاستراتيجي\n"
         "🔵 GPT-4o — صوت السوق\n\n"
-        "*المصادر (5):*\n"
+        "*المصادر (8 RSS + 2 APIs):*\n"
         "📡 CoinDesk + The Block + CoinTelegraph\n"
-        "📡 CoinGecko News + CryptoPanic\n\n"
+        "📡 Decrypt + Bitcoin Magazine + Crypto Briefing\n"
+        "📡 U.Today + Bitcoinist + CoinGecko + CryptoPanic\n\n"
         "*الميزات:*\n"
         "🤖 تحليل ذكي بـ 3 خبراء AI\n"
         "💼 ربط مع محفظتك من DCA BOT\n"
@@ -2269,18 +2277,30 @@ async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_event_loop()
     results = await loop.run_in_executor(None, run_connectivity_test)
 
-    lines = ["🔍 *نتيجة الفحص:*\n", "*المصادر:*"]
+    lines = ["🔍 *نتيجة الفحص:*\n", "*المصادر RSS (8):*"]
 
-    sources = ["CoinDesk", "The Block", "CoinTelegraph", "CoinGecko",
-               "CryptoPanic"]
-    for src in sources:
+    rss_sources = ["CoinDesk", "The Block", "CoinTelegraph",
+                   "Decrypt", "BitcoinMagazine", "CryptoBriefing",
+                   "U.Today", "Bitcoinist"]
+    for src in rss_sources:
         r = results.get(src, {})
         if r.get("ok"):
             lines.append(f"✅ {src}: {r.get('count', 0)} خبر | "
                          f"{r.get('elapsed_ms', 0)}ms")
         else:
-            err = r.get("error", "?")[:60]
+            err = r.get("error", "?")[:50]
             lines.append(f"❌ {src}: _{err}_")
+
+    lines.append("")
+    lines.append("*المصادر الإضافية:*")
+    api_sources = ["CoinGecko", "CryptoPanic"]
+    for src in api_sources:
+        r = results.get(src, {})
+        if r.get("ok"):
+            lines.append(f"✅ {src}: {r.get('count', 0)} خبر")
+        else:
+            err = r.get("error", "?")[:40]
+            lines.append(f"⚪ {src}: _{err}_")
 
     lines.append("")
     lines.append("*🤝 Council of AI Experts:*")
@@ -2325,16 +2345,19 @@ async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
         lines.append(f"⚪ Portfolio: غير متصل (DCA data غير موجود)")
 
     # Summary
-    ok_sources = sum(1 for s in sources if results.get(s, {}).get("ok"))
+    all_sources_list = rss_sources + api_sources
+    ok_sources = sum(1 for s in all_sources_list
+                     if results.get(s, {}).get("ok"))
+    total_sources = len(all_sources_list)
     ai_count = sum(1 for k in ["Gemini", "Claude", "OpenAI"]
                    if results.get(k, {}).get("ok"))
     lines.append("")
-    if ok_sources >= 3 and ai_count == 3:
-        lines.append(f"🎯 *الحالة:* ممتاز ({ok_sources}/5 + Council 3/3) ⭐")
-    elif ok_sources >= 3 and ai_count >= 1:
-        lines.append(f"✅ *الحالة:* جيد ({ok_sources}/5 + AI {ai_count}/3)")
-    elif ok_sources >= 2:
-        lines.append(f"⚠️ *الحالة:* محدود ({ok_sources}/5)")
+    if ok_sources >= 6 and ai_count == 3:
+        lines.append(f"🎯 *الحالة:* ممتاز ({ok_sources}/{total_sources} + Council 3/3) ⭐")
+    elif ok_sources >= 4 and ai_count >= 1:
+        lines.append(f"✅ *الحالة:* جيد ({ok_sources}/{total_sources} + AI {ai_count}/3)")
+    elif ok_sources >= 3:
+        lines.append(f"⚠️ *الحالة:* محدود ({ok_sources}/{total_sources})")
     else:
         lines.append("🚨 *الحالة:* غير جاهز")
 
@@ -2653,7 +2676,8 @@ async def cmd_sources(u: Update, c: ContextTypes.DEFAULT_TYPE):
              ""]
 
     all_sources = ["CoinDesk", "The Block", "CoinTelegraph",
-                   "CoinGecko", "CryptoPanic"]
+                   "Decrypt", "BitcoinMagazine", "CryptoBriefing",
+                   "U.Today", "Bitcoinist", "CoinGecko", "CryptoPanic"]
     for src in all_sources:
         count = by_source.get(src, 0)
         icon = "✅" if count > 0 else "⚪"
@@ -2801,11 +2825,16 @@ def _print_banner():
     print(f"    🟣 Claude      : {cl_status}  ({CLAUDE_MODEL})")
     print(f"    🔵 OpenAI      : {oa_status}  ({OPENAI_MODEL})")
     print(f"  المصادر         :")
-    print(f"    📡 CoinDesk    : RSS")
-    print(f"    📡 The Block   : RSS")
-    print(f"    📡 CoinTelegraph: RSS")
-    print(f"    📡 CoinGecko   : API")
-    print(f"    📡 CryptoPanic : {cp_status}")
+    print(f"    📡 CoinDesk        : RSS")
+    print(f"    📡 The Block       : RSS")
+    print(f"    📡 CoinTelegraph   : RSS")
+    print(f"    📡 Decrypt         : RSS")
+    print(f"    📡 BitcoinMagazine : RSS")
+    print(f"    📡 CryptoBriefing  : RSS")
+    print(f"    📡 U.Today         : RSS")
+    print(f"    📡 Bitcoinist      : RSS")
+    print(f"    📡 CoinGecko       : API")
+    print(f"    📡 CryptoPanic     : {cp_status}")
     print(f"  Storage          : {DATA_DIR}")
     print(f"  Portfolio link   : {DCA_DATA_DIR}/portfolio_latest.json")
     print(f"  Coin DB          : {len(KNOWN_COINS)} coins tracked")
