@@ -1,73 +1,79 @@
-# 📰 NEWS_CRYPTO_BOT v1.0
+# 📰 NEWS_CRYPTO_BOT v2.1 — Council of AI Experts
 
-**Smart Crypto News + AI Analysis Bot**
+**Smart Crypto News with 3 AI Experts Analysis**
 
-## 🎯 الميزات
+## 🤝 Council of AI Experts
 
-| # | الميزة | الوصف |
+| AI | الشخصية | التخصص |
 |---|---|---|
-| 1 | 📡 5 مصادر | CoinDesk + The Block + CoinTelegraph + CoinGecko + CryptoPanic |
-| 2 | 🤖 Gemini AI | تحليل sentiment + impact + reasoning |
-| 3 | 💼 Portfolio Link | يقرأ DCA_BOT portfolio لربط الأخبار بعملاتك |
-| 4 | 🔔 تنبيهات تلقائية | كل 30 دقيقة + ملخص يومي |
-| 5 | 📊 Sentiment Overview | تتبع لكل عملة (% bullish) |
+| 🟢 **Gemini 2.5 Flash** | العين السريعة | Sentiment + Impact للجميع |
+| 🟣 **Claude Opus 4.5** | المحلل الاستراتيجي | Risk + سياق تاريخي |
+| 🔵 **GPT-4o** | صوت السوق | توصيات تنفيذية + Levels |
+
+## 🎯 Smart Routing
+
+```
+كل خبر يمر بـ Tier ذكي:
+
+⚡ Fast (Gemini فقط) → كل الأخبار
+📊 Deep (+Claude) → high impact OR portfolio match
+🤝 Council (+OpenAI) → high impact + portfolio match
+```
 
 ## 🔑 Environment Variables
 
+### إلزامية
 ```
-BOT_TOKEN              (إلزامي - من BotFather)
-GEMINI_API_KEY         (إلزامي - من Google AI Studio)
-CRYPTOPANIC_KEY        (اختياري - حدود أعلى)
-COINGECKO_KEY          (اختياري - demo key)
-DATA_DIR=/data         (auto-set)
-DCA_DATA_DIR=/data     (لربط DCA_BOT portfolio)
+BOT_TOKEN              من BotFather
+GEMINI_API_KEY         من Google AI Studio
 ```
 
-## 🌐 Railway Setup
+### للـ Council (موصى به)
+```
+CLAUDE_API_KEY         من console.anthropic.com
+OPENAI_API_KEY         من platform.openai.com
+```
 
-1. Region: `europe-west4`
-2. Volume: mount at `/data`
-3. Variables: BOT_TOKEN + GEMINI_API_KEY (إلزاميين)
-
-### للربط مع DCA_BOT:
-شارك نفس الـ Volume بين البوتين، أو ضع DCA_DATA_DIR لمسار portfolio_latest.json
+### اختيارية
+```
+CRYPTOPANIC_KEY        ⚪ ليس ضرورياً
+COINGECKO_KEY          ⚪ ليس ضرورياً
+DCA_DATA_DIR=/data     لربط محفظة DCA_BOT
+```
 
 ## 📝 الأوامر
 
 | الأمر | الوظيفة |
 |---|---|
 | `/start` | القائمة |
-| `/test` | فحص المصادر + Gemini + Storage |
+| `/test` | فحص شامل + Council |
 | `/news` | آخر 10 أخبار |
 | `/news BTC` | أخبار عملة معينة |
-| `/breaking` | الأخبار العاجلة (high impact) |
+| `/breaking` | الأخبار العاجلة |
+| `/council` | 🤝 تحليل بـ 3 خبراء ⭐ |
+| `/council BTC` | Council لخبر عن عملة |
 | `/sentiment` | sentiment لكل العملات |
-| `/sentiment BTC` | sentiment عملة معينة |
-| `/digest` | ملخص يومي الآن |
+| `/digest` | ملخص يومي |
 | `/sources` | حالة المصادر |
-| `/monitor` | تشغيل/إيقاف التنبيهات التلقائية |
-| `/monitor off` | إيقاف فقط |
-
-## 🤖 AI Logic
-
-```
-كل خبر يمر بـ:
-1. Coin Detection (regex match)
-2. Portfolio Match (DCA_BOT data)
-3. Gemini Analysis (sentiment + impact + reasoning)
-4. Decision:
-   - high impact → 🚨 breaking alert
-   - medium + portfolio match → 💼 personal alert
-   - low → خفي عن التنبيهات
-```
+| `/monitor` | تشغيل/إيقاف التنبيهات |
+| `/gemdebug` | تشخيص Gemini |
 
 ## 🔔 أنواع التنبيهات
 
-- 🚨 **Breaking**: high impact (5%+ price move expected)
-- 💼 **Portfolio**: medium impact + يخص عملة في محفظتك
+- 🚨🚨 **Council Alert**: high impact + portfolio (3 خبراء)
+- 🚨 **Breaking**: high impact (Gemini)
+- 💼 **Portfolio**: medium impact + يخص محفظتك
 - 📅 **Daily Digest**: 8 صباحاً يومياً
 
-**Cooldown**: 4 ساعات لكل خبر | حد أقصى 3 تنبيهات لكل scan
+## 💰 التكلفة المتوقعة
+
+```
+Gemini (1M tokens/يوم مجاني):     $0
+Claude (~10 خبر مهم/يوم):         ~$2/شهر
+OpenAI (~3 خبر عاجل/يوم):          ~$1/شهر
+─────────────────────────────────────
+الإجمالي:                          ~$3/شهر
+```
 
 ## ⚠️ Disclaimer
 

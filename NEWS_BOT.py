@@ -49,6 +49,8 @@ log = logging.getLogger("NEWS_BOT")
 # ── Environment Variables ──
 BOT_TOKEN          = os.environ.get("BOT_TOKEN", "").strip()
 GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "").strip()
+CLAUDE_API_KEY     = os.environ.get("CLAUDE_API_KEY", "").strip()
+OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY", "").strip()
 CRYPTOPANIC_KEY    = os.environ.get("CRYPTOPANIC_KEY", "").strip()
 COINGECKO_KEY      = os.environ.get("COINGECKO_KEY", "").strip()
 
@@ -65,6 +67,16 @@ GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 # Single primary model — proven working in CRYPTO_SCANNER_BOT.
 # If Google deprecates this, use /gemdebug to find a replacement.
 GEMINI_MODEL = "gemini-2.5-flash"
+
+# Claude API (Anthropic) — strategic deep analysis
+CLAUDE_BASE = "https://api.anthropic.com/v1/messages"
+CLAUDE_MODEL = "claude-opus-4-5"           # latest Opus (best reasoning)
+CLAUDE_FALLBACK = "claude-sonnet-4-5"      # cheaper fallback
+
+# OpenAI API — execution recommendations
+OPENAI_BASE = "https://api.openai.com/v1/chat/completions"
+OPENAI_MODEL = "gpt-4o"                     # primary
+OPENAI_FALLBACK = "gpt-4o-mini"             # cheaper fallback
 
 RSS_FEEDS = {
     "CoinDesk":      "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -672,7 +684,304 @@ Rules:
 
 
 
-def should_analyze(article: Dict) -> bool:
+def claude_analyze(article: Dict) -> Optional[Dict]:
+    """
+    🟣 Claude — Strategic Analyst.
+    Deep reasoning, historical context, risk assessment.
+    Returns: {scenario_ar, risks_ar, historical_ar, confidence}
+    """
+    if not CLAUDE_API_KEY:
+        return None
+
+    title = article.get("title", "")
+    summary = article.get("summary", "")[:400]
+    coins = article.get("coins", [])
+    portfolio_match = article.get("portfolio_match", [])
+    gemini_result = article.get("ai", {})
+
+    coins_str = ", ".join(coins) if coins else "general crypto market"
+    portfolio_str = ", ".join(portfolio_match) if portfolio_match else "none"
+    gemini_sentiment = gemini_result.get("sentiment", "unknown")
+    gemini_impact = gemini_result.get("impact", "unknown")
+
+    prompt = f"""You are a senior crypto market strategist. Analyze this news with DEEP reasoning.
+
+NEWS:
+TITLE: {title}
+SUMMARY: {summary}
+COINS: {coins_str}
+USER_PORTFOLIO_AFFECTED: {portfolio_str}
+
+PRIOR ANALYSIS (Gemini):
+- Sentiment: {gemini_sentiment}
+- Impact: {gemini_impact}
+
+YOUR TASK: Provide strategic analysis. Reply with ONLY this JSON (no markdown, no code fences):
+
+{{
+  "scenario_ar": "السيناريو الأرجح خلال 24-48 ساعة (3-4 أسطر بالعربي)",
+  "risks_ar": "أهم 2-3 مخاطر يجب الحذر منها (بالعربي)",
+  "historical_ar": "سياق تاريخي: متى حدث شيء مشابه وما كانت النتيجة (سطرين بالعربي)",
+  "confidence": "high OR medium OR low",
+  "agree_with_gemini": true OR false
+}}
+
+Be specific. Use price levels if relevant. Mention specific dates/events if relevant."""
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": CLAUDE_API_KEY,
+        "anthropic-version": "2023-06-01",
+    }
+    body = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": 800,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    try:
+        r = _session.post(CLAUDE_BASE, headers=headers, json=body, timeout=(10, 35))
+    except Exception as e:
+        log.warning(f"[CLAUDE] request failed: {type(e).__name__}: {e}")
+        return None
+
+    # Try fallback model if primary fails with 404 or model error
+    if r.status_code in (404, 400):
+        log.info(f"[CLAUDE] {CLAUDE_MODEL} unavailable, trying {CLAUDE_FALLBACK}")
+        body["model"] = CLAUDE_FALLBACK
+        try:
+            r = _session.post(CLAUDE_BASE, headers=headers, json=body, timeout=(10, 35))
+        except Exception as e:
+            log.warning(f"[CLAUDE] fallback failed: {e}")
+            return None
+
+    if r.status_code != 200:
+        log.warning(f"[CLAUDE] HTTP {r.status_code}: {r.text[:120]}")
+        return None
+
+    try:
+        data = r.json()
+        content = data.get("content", [])
+        if not content:
+            return None
+        text = content[0].get("text", "").strip()
+    except (KeyError, IndexError, ValueError) as e:
+        log.warning(f"[CLAUDE] response parse: {e}")
+        return None
+
+    # Strip code fences
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```\s*$", "", text)
+    text = text.strip()
+
+    parsed = None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                log.warning(f"[CLAUDE] JSON unparseable: {text[:80]}")
+                return None
+
+    if not parsed:
+        return None
+
+    return {
+        "scenario_ar":      parsed.get("scenario_ar", ""),
+        "risks_ar":         parsed.get("risks_ar", ""),
+        "historical_ar":    parsed.get("historical_ar", ""),
+        "confidence":       str(parsed.get("confidence", "medium")).lower(),
+        "agree_with_gemini": bool(parsed.get("agree_with_gemini", True)),
+    }
+
+
+def openai_analyze(article: Dict) -> Optional[Dict]:
+    """
+    🔵 OpenAI GPT-4o — Market Voice / Execution Advisor.
+    Specific actionable recommendations + price levels.
+    Returns: {action_ar, levels, time_window_ar, conviction}
+    """
+    if not OPENAI_API_KEY:
+        return None
+
+    title = article.get("title", "")
+    summary = article.get("summary", "")[:400]
+    coins = article.get("coins", [])
+    portfolio_match = article.get("portfolio_match", [])
+    gemini_result = article.get("ai", {})
+    claude_result = article.get("claude", {})
+
+    coins_str = ", ".join(coins) if coins else "general crypto market"
+    portfolio_str = ", ".join(portfolio_match) if portfolio_match else "none"
+
+    context_lines = [
+        f"Gemini sentiment: {gemini_result.get('sentiment', 'N/A')}",
+        f"Gemini impact: {gemini_result.get('impact', 'N/A')}",
+    ]
+    if claude_result:
+        context_lines.append(f"Claude scenario: {claude_result.get('scenario_ar', 'N/A')[:100]}")
+        context_lines.append(f"Claude confidence: {claude_result.get('confidence', 'N/A')}")
+    context_str = "\n".join(context_lines)
+
+    prompt = f"""You are a crypto trading desk advisor. Give SPECIFIC actionable advice.
+
+NEWS:
+TITLE: {title}
+SUMMARY: {summary}
+COINS: {coins_str}
+USER_PORTFOLIO_AFFECTED: {portfolio_str}
+
+EXISTING ANALYSIS:
+{context_str}
+
+YOUR TASK: Practical execution recommendations. Reply with ONLY this JSON:
+
+{{
+  "action_ar": "1-3 توصيات تنفيذية محددة بالعربي (مثلاً: 'لا تبيع بانيك', 'راقب stop loss عند X', 'احتفظ')",
+  "levels": {{
+    "support": "price level OR null",
+    "resistance": "price level OR null",
+    "stop_loss": "price level OR null"
+  }},
+  "time_window_ar": "متى يجب اتخاذ القرار (مثلاً: 'خلال 4-6 ساعات قبل ECB' أو 'لا داعي للعجلة')",
+  "conviction": "high OR medium OR low",
+  "primary_coin_affected": "ticker OR 'multiple'"
+}}
+
+Be DECISIVE but never financial advice. Use specific levels when news mentions prices."""
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+    }
+    body = {
+        "model": OPENAI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 600,
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        r = _session.post(OPENAI_BASE, headers=headers, json=body, timeout=(10, 35))
+    except Exception as e:
+        log.warning(f"[OPENAI] request failed: {type(e).__name__}: {e}")
+        return None
+
+    # Fallback to gpt-4o-mini if primary fails
+    if r.status_code in (404, 400):
+        log.info(f"[OPENAI] {OPENAI_MODEL} issue, trying {OPENAI_FALLBACK}")
+        body["model"] = OPENAI_FALLBACK
+        try:
+            r = _session.post(OPENAI_BASE, headers=headers, json=body, timeout=(10, 35))
+        except Exception as e:
+            log.warning(f"[OPENAI] fallback failed: {e}")
+            return None
+
+    if r.status_code != 200:
+        log.warning(f"[OPENAI] HTTP {r.status_code}: {r.text[:120]}")
+        return None
+
+    try:
+        data = r.json()
+        text = data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, ValueError) as e:
+        log.warning(f"[OPENAI] response parse: {e}")
+        return None
+
+    # OpenAI with json_object format gives clean JSON, but be safe
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```\s*$", "", text)
+
+    parsed = None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                log.warning(f"[OPENAI] JSON unparseable: {text[:80]}")
+                return None
+
+    if not parsed:
+        return None
+
+    levels = parsed.get("levels", {}) or {}
+    return {
+        "action_ar":             parsed.get("action_ar", ""),
+        "support":               levels.get("support"),
+        "resistance":            levels.get("resistance"),
+        "stop_loss":             levels.get("stop_loss"),
+        "time_window_ar":        parsed.get("time_window_ar", ""),
+        "conviction":            str(parsed.get("conviction", "medium")).lower(),
+        "primary_coin_affected": parsed.get("primary_coin_affected", ""),
+    }
+
+
+def council_analyze(article: Dict, tier: str = "fast") -> Dict:
+    """
+    🤝 Council Coordinator — Routes article through AI tiers.
+
+    Tiers:
+    - "fast":    Gemini only (default for all news)
+    - "deep":    Gemini + Claude (for important news)
+    - "council": Gemini + Claude + GPT-4o (for breaking news)
+
+    Returns updated article dict (in-place too).
+    """
+    # Tier 1: Gemini (always first, fast)
+    if "ai" not in article:
+        gem = gemini_analyze(article)
+        if gem:
+            article["ai"] = gem
+
+    if tier == "fast":
+        return article
+
+    # Tier 2: Claude (deep reasoning)
+    if "claude" not in article and CLAUDE_API_KEY:
+        clde = claude_analyze(article)
+        if clde:
+            article["claude"] = clde
+
+    if tier == "deep":
+        return article
+
+    # Tier 3: OpenAI (execution advice)
+    if "openai" not in article and OPENAI_API_KEY:
+        oai = openai_analyze(article)
+        if oai:
+            article["openai"] = oai
+
+    return article
+
+
+def determine_tier(article: Dict) -> str:
+    """
+    Decide which AI tier to use based on article importance.
+    """
+    ai = article.get("ai", {})
+    impact = ai.get("impact", "low")
+    is_portfolio = article.get("is_portfolio_relevant", False)
+
+    # Council (full team) for breaking news affecting portfolio
+    if impact == "high" and is_portfolio:
+        return "council"
+
+    # Deep (Gemini + Claude) for any important news
+    if impact == "high" or is_portfolio:
+        return "deep"
+
+    # Fast (Gemini only) for everything else
+    return "fast"
+
+
+
     """
     Decide if article deserves Gemini analysis (saves quota).
     Strategy: only analyze if relevant to portfolio OR has coin mentions.
@@ -686,21 +995,73 @@ def should_analyze(article: Dict) -> bool:
 
 
 def enrich_with_ai(articles: List[Dict],
-                    max_to_analyze: int = 8) -> List[Dict]:
-    """Run AI analysis on top N relevant articles."""
+                    max_to_analyze: int = 8,
+                    enable_council: bool = True) -> List[Dict]:
+    """
+    Run AI analysis on relevant articles using Council pattern.
+
+    Phase 1 (always): Gemini analyzes all candidates
+    Phase 2 (council): Claude + OpenAI for important ones
+    """
     candidates = [a for a in articles if should_analyze(a)]
     candidates = candidates[:max_to_analyze]
 
-    log.info(f"[AI] analyzing {len(candidates)} articles...")
+    log.info(f"[AI] Phase 1 (Gemini): {len(candidates)} articles...")
 
+    # Phase 1: Gemini for all candidates
     for a in candidates:
         try:
             ai = gemini_analyze(a)
             if ai:
                 a["ai"] = ai
-            time.sleep(0.3)  # gentle rate limit
+            time.sleep(0.3)
         except Exception as e:
             log.warning(f"[AI] {a.get('title','?')[:40]}: {e}")
+
+    # Phase 2: Council escalation (only if enabled)
+    if enable_council:
+        # Determine which articles need deeper analysis
+        deep_targets = []
+        council_targets = []
+        for a in candidates:
+            tier = determine_tier(a)
+            if tier == "council":
+                council_targets.append(a)
+            elif tier == "deep":
+                deep_targets.append(a)
+
+        # Limit to avoid burning quota — top 3 council, top 5 deep
+        council_targets = council_targets[:3]
+        deep_targets = deep_targets[:5]
+
+        if council_targets:
+            log.info(f"[AI] Phase 2a (Council): {len(council_targets)} articles")
+            for a in council_targets:
+                try:
+                    if CLAUDE_API_KEY:
+                        clde = claude_analyze(a)
+                        if clde:
+                            a["claude"] = clde
+                        time.sleep(0.3)
+                    if OPENAI_API_KEY:
+                        oai = openai_analyze(a)
+                        if oai:
+                            a["openai"] = oai
+                        time.sleep(0.3)
+                except Exception as e:
+                    log.warning(f"[COUNCIL] {a.get('title','?')[:40]}: {e}")
+
+        if deep_targets:
+            log.info(f"[AI] Phase 2b (Deep): {len(deep_targets)} articles")
+            for a in deep_targets:
+                try:
+                    if CLAUDE_API_KEY:
+                        clde = claude_analyze(a)
+                        if clde:
+                            a["claude"] = clde
+                        time.sleep(0.3)
+                except Exception as e:
+                    log.warning(f"[DEEP] {a.get('title','?')[:40]}: {e}")
 
     return articles
 
@@ -869,6 +1230,148 @@ def format_article_detailed(a: Dict) -> str:
     lines.append(f"🔗 [قراءة الخبر كاملاً]({a.get('url','')})")
     lines.append("")
     lines.append("⚠️ _تحليل آلي — تنفيذ يدوي 100%_")
+
+    return "\n".join(lines)
+
+
+def format_council_alert(a: Dict) -> str:
+    """
+    🤝 Council format — full 3-AI analysis for breaking news.
+    Used for high-impact news affecting user's portfolio.
+    """
+    title = a.get("title", "")
+    source = a.get("source", "?")
+    age = _time_ago(a.get("ts", int(time.time())))
+    coins = a.get("coins", [])
+    portfolio_match = a.get("portfolio_match", [])
+
+    gem = a.get("ai", {})
+    clde = a.get("claude", {})
+    oai = a.get("openai", {})
+
+    lines = []
+
+    # ── Header ──
+    if clde and oai:
+        lines.append("🚨🚨 *تنبيه أحمر — خبر عالي الأهمية*")
+    elif clde:
+        lines.append("🚨 *تنبيه — تحليل عميق*")
+    else:
+        lines.append("🚨 *تنبيه*")
+    lines.append("")
+
+    lines.append(f"📰 *{title}*")
+    lines.append(f"📡 {source} · {age}")
+
+    if coins:
+        lines.append(f"🪙 العملات: `{', '.join(coins[:5])}`")
+    if portfolio_match:
+        lines.append(f"💼 *من محفظتك:* `{', '.join(portfolio_match)}`")
+
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+
+    # ── 🟢 Gemini (Quick Eye) ──
+    if gem:
+        sent = gem.get("sentiment", "neutral")
+        impact = gem.get("impact", "low")
+        sent_emoji = _SENTIMENT_EMOJI.get(sent, "")
+        lines.append("")
+        lines.append("🟢 *العين السريعة (Gemini):*")
+        lines.append(f"   📊 Sentiment: {sent_emoji} {_SENTIMENT_AR.get(sent, sent)}")
+        lines.append(f"   ⚡ Impact: {_IMPACT_AR.get(impact, impact)}")
+        summary = gem.get("summary_ar", "")
+        if summary:
+            lines.append(f"   📝 {summary}")
+
+    # ── 🟣 Claude (Strategic Analyst) ──
+    if clde:
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("")
+        lines.append("🟣 *المحلل الاستراتيجي (Claude):*")
+        scenario = clde.get("scenario_ar", "")
+        if scenario:
+            lines.append(f"")
+            lines.append(f"   🎯 *السيناريو:*")
+            lines.append(f"   {scenario}")
+        risks = clde.get("risks_ar", "")
+        if risks:
+            lines.append(f"")
+            lines.append(f"   ⚠️ *المخاطر:*")
+            lines.append(f"   {risks}")
+        historical = clde.get("historical_ar", "")
+        if historical:
+            lines.append(f"")
+            lines.append(f"   📚 *سياق تاريخي:*")
+            lines.append(f"   {historical}")
+
+        confidence = clde.get("confidence", "medium")
+        agree = clde.get("agree_with_gemini", True)
+        agree_str = "متفق مع Gemini" if agree else "*يخالف Gemini*"
+        lines.append(f"")
+        lines.append(f"   🎚 ثقة: `{confidence}` · {agree_str}")
+
+    # ── 🔵 OpenAI (Market Voice) ──
+    if oai:
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("")
+        lines.append("🔵 *صوت السوق (GPT-4o):*")
+        action = oai.get("action_ar", "")
+        if action:
+            lines.append(f"")
+            lines.append(f"   🎯 *توصية تنفيذية:*")
+            lines.append(f"   {action}")
+
+        # Price levels
+        support = oai.get("support")
+        resistance = oai.get("resistance")
+        stop_loss = oai.get("stop_loss")
+        if any([support, resistance, stop_loss]):
+            lines.append(f"")
+            lines.append(f"   📈 *مستويات مهمة:*")
+            if support and support != "null":
+                lines.append(f"   • Support: `{support}`")
+            if resistance and resistance != "null":
+                lines.append(f"   • Resistance: `{resistance}`")
+            if stop_loss and stop_loss != "null":
+                lines.append(f"   • Stop Loss: `{stop_loss}`")
+
+        time_window = oai.get("time_window_ar", "")
+        if time_window:
+            lines.append(f"")
+            lines.append(f"   ⏰ *نافذة القرار:* {time_window}")
+
+        conviction = oai.get("conviction", "medium")
+        lines.append(f"")
+        lines.append(f"   🎚 قناعة: `{conviction}`")
+
+    # ── 🤝 Council Verdict ──
+    if clde and oai:
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("")
+        gemini_sent = gem.get("sentiment", "neutral")
+        claude_agrees = clde.get("agree_with_gemini", True)
+        confidence = clde.get("confidence", "medium")
+        conviction = oai.get("conviction", "medium")
+
+        if claude_agrees and confidence == "high" and conviction == "high":
+            verdict = "🎯 *إجماع 3/3 — قناعة عالية*"
+        elif claude_agrees:
+            verdict = "✅ *Claude متفق مع Gemini*"
+        else:
+            verdict = "⚠️ *Claude يخالف — تحقق إضافي مطلوب*"
+
+        lines.append(f"🤝 *Council Verdict:*")
+        lines.append(f"   {verdict}")
+
+    lines.append("")
+    lines.append(f"🔗 [قراءة الخبر كاملاً]({a.get('url','')})")
+    lines.append("")
+    lines.append("⚠️ _تحليل آلي بـ 3 خبراء — تنفيذ يدوي 100%_")
+    lines.append("⚠️ _ليست نصيحة مالية_")
 
     return "\n".join(lines)
 
@@ -1106,6 +1609,54 @@ def run_connectivity_test() -> Dict[str, Any]:
     else:
         results["Gemini"] = {"ok": False, "error": "GEMINI_API_KEY missing"}
 
+    # Claude (only test if key present, avoid burning quota otherwise)
+    if CLAUDE_API_KEY:
+        start = time.time()
+        try:
+            test_article = {
+                "title": "Bitcoin reaches new all-time high above $100,000",
+                "summary": "BTC surged past $100K driven by ETF inflows.",
+                "coins": ["BTC"],
+                "ai": {"sentiment": "bullish", "impact": "high"},
+            }
+            clde = claude_analyze(test_article)
+            elapsed = int((time.time() - start) * 1000)
+            results["Claude"] = {
+                "ok": clde is not None,
+                "elapsed_ms": elapsed,
+                "model": CLAUDE_MODEL,
+            }
+            if clde:
+                results["Claude"]["sample_confidence"] = clde.get("confidence", "?")
+        except Exception as e:
+            results["Claude"] = {"ok": False, "error": str(e)[:80]}
+    else:
+        results["Claude"] = {"ok": False, "error": "CLAUDE_API_KEY missing", "skipped": True}
+
+    # OpenAI (only test if key present)
+    if OPENAI_API_KEY:
+        start = time.time()
+        try:
+            test_article = {
+                "title": "Bitcoin reaches new all-time high above $100,000",
+                "summary": "BTC surged past $100K driven by ETF inflows.",
+                "coins": ["BTC"],
+                "ai": {"sentiment": "bullish", "impact": "high"},
+            }
+            oai = openai_analyze(test_article)
+            elapsed = int((time.time() - start) * 1000)
+            results["OpenAI"] = {
+                "ok": oai is not None,
+                "elapsed_ms": elapsed,
+                "model": OPENAI_MODEL,
+            }
+            if oai:
+                results["OpenAI"]["sample_conviction"] = oai.get("conviction", "?")
+        except Exception as e:
+            results["OpenAI"] = {"ok": False, "error": str(e)[:80]}
+    else:
+        results["OpenAI"] = {"ok": False, "error": "OPENAI_API_KEY missing", "skipped": True}
+
     # Storage
     storage_ok = storage_save("_health_check.json", {"ts": now_iso()})
     results["Storage"] = {"ok": storage_ok, "path": DATA_DIR}
@@ -1186,7 +1737,18 @@ async def news_monitor_job(context: ContextTypes.DEFAULT_TYPE):
 
         for alert in alerts_to_send:
             try:
-                msg = format_article_detailed(alert)
+                # Decide format: Council for breaking+portfolio, detailed for others
+                ai = alert.get("ai", {})
+                impact = ai.get("impact", "low")
+                is_portfolio = alert.get("is_portfolio_relevant", False)
+                use_council = (impact == "high" and is_portfolio
+                               and alert.get("claude") and alert.get("openai"))
+
+                if use_council:
+                    msg = format_council_alert(alert)
+                else:
+                    msg = format_article_detailed(alert)
+
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=msg,
@@ -1228,30 +1790,36 @@ async def daily_digest_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "📰 *NEWS CRYPTO BOT v1.0*\n"
-        "_Smart Crypto News + AI Analysis_\n\n"
+        "📰 *NEWS CRYPTO BOT v2.1*\n"
+        "_Smart Crypto News + AI Council_\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
+        "*🤝 Council of 3 AI Experts:*\n"
+        "🟢 Gemini — العين السريعة\n"
+        "🟣 Claude — المحلل الاستراتيجي\n"
+        "🔵 GPT-4o — صوت السوق\n\n"
         "*المصادر (5):*\n"
         "📡 CoinDesk + The Block + CoinTelegraph\n"
         "📡 CoinGecko News + CryptoPanic\n\n"
         "*الميزات:*\n"
-        "🤖 تحليل AI بـ Gemini (sentiment + impact)\n"
+        "🤖 تحليل ذكي بـ 3 خبراء AI\n"
         "💼 ربط مع محفظتك من DCA BOT\n"
-        "🔔 تنبيهات تلقائية للأخبار المهمة\n"
+        "🔔 تنبيهات فورية للأخبار العاجلة\n"
         "📊 Sentiment overview لكل عملة\n"
         "📅 ملخص يومي تلقائي\n\n"
         "*الأوامر:*\n"
         "`/start`           القائمة\n"
-        "`/test`            فحص المصادر + Gemini\n"
-        "`/news`            آخر الأخبار المهمة\n"
+        "`/test`            فحص شامل + Council\n"
+        "`/news`            آخر الأخبار\n"
         "`/news BTC`        أخبار عملة معينة\n"
-        "`/breaking`        أخبار عاجلة (high impact)\n"
+        "`/breaking`        الأخبار العاجلة\n"
+        "`/council`         🤝 تحليل بـ 3 خبراء ⭐\n"
+        "`/council BTC`     Council لخبر عن عملة\n"
         "`/sentiment`       sentiment لكل العملات\n"
-        "`/sentiment BTC`   sentiment عملة معينة\n"
         "`/digest`          ملخص يومي الآن\n"
         "`/sources`         حالة المصادر\n"
-        "`/monitor`         تشغيل/إيقاف التنبيهات التلقائية\n\n"
+        "`/monitor`         تشغيل/إيقاف التنبيهات\n\n"
         "*أنواع التنبيهات:*\n"
+        "🚨🚨 Council تنبيه (high + portfolio)\n"
         "🚨 خبر عاجل (high impact)\n"
         "💼 خبر يخص محفظتك\n"
         "📅 ملخص يومي (8 صباحاً)\n\n"
@@ -1474,15 +2042,32 @@ async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
             lines.append(f"❌ {src}: _{err}_")
 
     lines.append("")
-    lines.append("*الذكاء الاصطناعي:*")
+    lines.append("*🤝 Council of AI Experts:*")
+
+    # Gemini (always available)
     g = results.get("Gemini", {})
     if g.get("ok"):
-        lines.append(f"✅ Gemini ({g.get('model','?')}): "
-                     f"{g.get('elapsed_ms', 0)}ms")
-        if "sample_sentiment" in g:
-            lines.append(f"   نموذج التحليل: `{g['sample_sentiment']}`")
+        lines.append(f"🟢 Gemini: ✅ {g.get('elapsed_ms', 0)}ms · `{g.get('sample_sentiment', '?')}`")
     else:
-        lines.append(f"❌ Gemini: _{g.get('error','?')[:60]}_")
+        lines.append(f"🟢 Gemini: ❌ _{g.get('error','?')[:50]}_")
+
+    # Claude
+    cl = results.get("Claude", {})
+    if cl.get("skipped"):
+        lines.append(f"🟣 Claude: ⚪ _مفتاح غير موجود_")
+    elif cl.get("ok"):
+        lines.append(f"🟣 Claude: ✅ {cl.get('elapsed_ms', 0)}ms · `{cl.get('sample_confidence', '?')}`")
+    else:
+        lines.append(f"🟣 Claude: ❌ _{cl.get('error','?')[:50]}_")
+
+    # OpenAI
+    oa = results.get("OpenAI", {})
+    if oa.get("skipped"):
+        lines.append(f"🔵 OpenAI: ⚪ _مفتاح غير موجود_")
+    elif oa.get("ok"):
+        lines.append(f"🔵 OpenAI: ✅ {oa.get('elapsed_ms', 0)}ms · `{oa.get('sample_conviction', '?')}`")
+    else:
+        lines.append(f"🔵 OpenAI: ❌ _{oa.get('error','?')[:50]}_")
 
     lines.append("")
     lines.append("*التخزين:*")
@@ -1500,12 +2085,13 @@ async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     # Summary
     ok_sources = sum(1 for s in sources if results.get(s, {}).get("ok"))
-    ai_ok = results.get("Gemini", {}).get("ok", False)
+    ai_count = sum(1 for k in ["Gemini", "Claude", "OpenAI"]
+                   if results.get(k, {}).get("ok"))
     lines.append("")
-    if ok_sources == 5 and ai_ok:
-        lines.append("🎯 *الحالة:* ممتاز (5/5 + AI)")
-    elif ok_sources >= 3 and ai_ok:
-        lines.append(f"✅ *الحالة:* جيد ({ok_sources}/5 + AI)")
+    if ok_sources >= 3 and ai_count == 3:
+        lines.append(f"🎯 *الحالة:* ممتاز ({ok_sources}/5 + Council 3/3) ⭐")
+    elif ok_sources >= 3 and ai_count >= 1:
+        lines.append(f"✅ *الحالة:* جيد ({ok_sources}/5 + AI {ai_count}/3)")
     elif ok_sources >= 2:
         lines.append(f"⚠️ *الحالة:* محدود ({ok_sources}/5)")
     else:
@@ -1565,8 +2151,88 @@ async def cmd_breaking(u: Update, c: ContextTypes.DEFAULT_TYPE):
         lines.append(format_article_brief(a))
         lines.append("")
 
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("💡 لتحليل عميق بـ 3 خبراء AI:")
+    lines.append("`/council` — للخبر العاجل الأهم")
+
     await u.message.reply_text(
         "\n".join(lines),
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_council(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """🤝 Council analysis — full 3 AI experts on top breaking news."""
+    args = c.args
+    filter_coin = args[0].upper() if args else None
+
+    msg = await u.message.reply_text(
+        "🤝 *Council جاري التحليل...*\n"
+        "🟢 Gemini → 🟣 Claude → 🔵 GPT-4o\n"
+        "_قد يستغرق 15-30 ثانية_",
+        parse_mode="Markdown"
+    )
+
+    # Load fresh news
+    loop = asyncio.get_event_loop()
+    articles = await loop.run_in_executor(None, run_news_pipeline, True)
+
+    # Filter by coin if specified
+    if filter_coin:
+        articles = [a for a in articles if filter_coin in a.get("coins", [])]
+
+    # Find highest-priority article
+    candidates = [
+        a for a in articles
+        if a.get("ai", {}).get("impact") == "high"
+    ]
+    if not candidates:
+        candidates = [
+            a for a in articles
+            if a.get("is_portfolio_relevant", False)
+        ]
+    if not candidates:
+        candidates = [
+            a for a in articles
+            if a.get("ai", {}).get("impact") == "medium"
+        ]
+
+    if not candidates:
+        await msg.delete()
+        suffix = f" لـ {filter_coin}" if filter_coin else ""
+        await u.message.reply_text(
+            f"⚪ *لا توجد أخبار مهمة الآن{suffix}*\n\n"
+            "Council يستخدم لأخبار high-impact أو portfolio-relevant.\n"
+            "السوق هادئ حالياً.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Pick most recent high-impact
+    target = candidates[0]
+
+    # Run full council
+    def _run_council():
+        return council_analyze(target, tier="council")
+
+    target = await loop.run_in_executor(None, _run_council)
+
+    # Save updated article
+    snap = storage_load("news_latest.json", {})
+    snap_articles = snap.get("articles", [])
+    for i, a in enumerate(snap_articles):
+        if a.get("id") == target.get("id"):
+            snap_articles[i] = target
+            break
+    snap["articles"] = snap_articles
+    storage_save("news_latest.json", snap)
+
+    formatted = format_council_alert(target)
+
+    await msg.delete()
+    await u.message.reply_text(
+        formatted,
         parse_mode="Markdown",
         disable_web_page_preview=True,
     )
@@ -1575,6 +2241,19 @@ async def cmd_breaking(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def cmd_sentiment(u: Update, c: ContextTypes.DEFAULT_TYPE):
     args = c.args
     coin = args[0].upper() if args else None
+
+    # Check if snapshot has AI-analyzed articles, refresh if not
+    snapshot = storage_load("news_latest.json", {})
+    articles = snapshot.get("articles", [])
+    has_ai = any(a.get("ai") for a in articles)
+
+    if not articles or not has_ai:
+        msg = await u.message.reply_text(
+            "⏳ جاري التحليل بـ AI..."
+        )
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, run_news_pipeline, True)
+        await msg.delete()
 
     formatted = format_sentiment(coin)
     await u.message.reply_text(formatted, parse_mode="Markdown")
@@ -1742,15 +2421,18 @@ async def _post_init(app):
 
 
 def _print_banner():
-    gem_status = "✅ مفعّل" if GEMINI_API_KEY else "⚪ معطّل (سيعمل بدون AI)"
+    gem_status = "✅" if GEMINI_API_KEY else "⚪"
+    cl_status = "✅" if CLAUDE_API_KEY else "⚪"
+    oa_status = "✅" if OPENAI_API_KEY else "⚪"
     cp_status = "✅" if CRYPTOPANIC_KEY else "⚪ public mode"
 
     print("=" * 70)
-    print("  📰 NEWS_CRYPTO_BOT v1.0 — Smart News + AI Analysis ✅")
+    print("  📰 NEWS_CRYPTO_BOT v2.1 — Smart News + AI Council ✅")
     print("=" * 70)
-    print(f"  AI Engine        :")
-    print(f"    🤖 Gemini      : {gem_status}")
-    print(f"    Model          : {GEMINI_MODEL}")
+    print(f"  🤝 Council of AI Experts:")
+    print(f"    🟢 Gemini      : {gem_status}  ({GEMINI_MODEL})")
+    print(f"    🟣 Claude      : {cl_status}  ({CLAUDE_MODEL})")
+    print(f"    🔵 OpenAI      : {oa_status}  ({OPENAI_MODEL})")
     print(f"  المصادر         :")
     print(f"    📡 CoinDesk    : RSS")
     print(f"    📡 The Block   : RSS")
@@ -1788,6 +2470,7 @@ def main():
     app.add_handler(CommandHandler("gemdebug", cmd_gemdebug))
     app.add_handler(CommandHandler("news", cmd_news))
     app.add_handler(CommandHandler("breaking", cmd_breaking))
+    app.add_handler(CommandHandler("council", cmd_council))
     app.add_handler(CommandHandler("sentiment", cmd_sentiment))
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("sources", cmd_sources))
