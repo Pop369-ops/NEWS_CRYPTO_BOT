@@ -90,7 +90,7 @@ CRYPTOPANIC_URL     = "https://cryptopanic.com/api/v1/posts/"
 CRYPTOPANIC_FREE_URL = "https://cryptopanic.com/api/free/v1/posts/"
 
 # ── Limits ──
-MAX_ARTICLE_AGE_HOURS = 4
+MAX_ARTICLE_AGE_HOURS = 2  # Reduced from 4 to ensure freshness
 MAX_ARTICLES_PER_FETCH = 15
 ALERT_COOLDOWN_HOURS = 4
 GEMINI_TIMEOUT = 25
@@ -508,14 +508,30 @@ def fetch_all_news() -> List[Dict]:
             seen.add(a["id"])
             unique.append(a)
 
-    # Filter by age
-    cutoff_ts = int(time.time()) - (MAX_ARTICLE_AGE_HOURS * 3600)
-    fresh = [a for a in unique if a["ts"] >= cutoff_ts]
+    # Filter by age (strict)
+    now_ts = int(time.time())
+    cutoff_ts = now_ts - (MAX_ARTICLE_AGE_HOURS * 3600)
+    fresh = []
+    too_old_count = 0
+    future_count = 0
+
+    for a in unique:
+        article_ts = a.get("ts", 0)
+        # Reject future timestamps (RSS bugs)
+        if article_ts > now_ts + 300:  # allow 5min clock skew
+            future_count += 1
+            continue
+        # Reject too old
+        if article_ts < cutoff_ts:
+            too_old_count += 1
+            continue
+        fresh.append(a)
 
     # Sort newest first
-    fresh.sort(key=lambda x: x["ts"], reverse=True)
+    fresh.sort(key=lambda x: x.get("ts", 0), reverse=True)
 
-    log.info(f"[FETCH] total: {len(all_articles)}, unique: {len(unique)}, fresh: {len(fresh)}")
+    log.info(f"[FETCH] total: {len(all_articles)}, unique: {len(unique)}, "
+             f"fresh: {len(fresh)}, too_old: {too_old_count}, future: {future_count}")
     return fresh
 
 
@@ -1300,15 +1316,23 @@ _IMPACT_AR = {
 
 
 def _time_ago(ts: int) -> str:
-    """Human-readable time since timestamp."""
+    """Human-readable time since timestamp. Marks stale items clearly."""
     diff = int(time.time()) - ts
+    if diff < 0:
+        return "الآن"
     if diff < 60:
         return "الآن"
     if diff < 3600:
         return f"منذ {diff // 60} دقيقة"
     if diff < 86400:
-        return f"منذ {diff // 3600} ساعة"
-    return f"منذ {diff // 86400} يوم"
+        hours = diff // 3600
+        return f"منذ {hours} ساعة"
+    days = diff // 86400
+    if days <= 7:
+        return f"⚠️ منذ {days} يوم"
+    if days <= 30:
+        return f"⚠️ منذ {days // 7} أسبوع"
+    return f"⚠️ قديم ({days // 30} شهر)"
 
 
 def format_article_brief(a: Dict, idx: Optional[int] = None) -> str:
@@ -2343,23 +2367,29 @@ async def cmd_breaking(u: Update, c: ContextTypes.DEFAULT_TYPE):
     articles = snapshot.get("articles", [])
 
     # Check freshness — refresh if older than 30 min
-    snap_age_min = 999
+    snap_age_min = None
+    snap_age_str = "أول مرة"
     if snapshot.get("timestamp"):
         try:
             snap_dt = datetime.fromisoformat(snapshot["timestamp"])
             snap_age_min = (datetime.now(TZ_RIYADH) - snap_dt).total_seconds() / 60
+            snap_age_str = f"منذ {int(snap_age_min)}د"
         except Exception:
             pass
 
     # Refetch if no articles, no AI, or older than 30 min
     has_ai = any(a.get("ai") for a in articles)
-    if not articles or not has_ai or snap_age_min > 30:
+    needs_refresh = (not articles or not has_ai or
+                     snap_age_min is None or snap_age_min > 30)
+
+    if needs_refresh:
         try:
             await msg.edit_text("⏳ جلب الأخبار الحديثة + تحليل AI...")
         except Exception:
             pass
         loop = asyncio.get_event_loop()
         articles = await loop.run_in_executor(None, run_news_pipeline, True)
+        snap_age_str = "للتو"
 
     # Find high-impact news
     high = [a for a in articles
@@ -2380,7 +2410,7 @@ async def cmd_breaking(u: Update, c: ContextTypes.DEFAULT_TYPE):
     # Decision tree
     if high:
         lines = [f"🚨 *أخبار عاجلة* ({len(high)})",
-                 f"🕐 {now_str()} · _آخر تحديث: منذ {int(snap_age_min)}د_",
+                 f"🕐 {now_str()} · _آخر تحديث: {snap_age_str}_",
                  "━━━━━━━━━━━━━━━━━━━━",
                  ""]
         for a in high[:5]:
@@ -2414,7 +2444,7 @@ async def cmd_breaking(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(
             f"⚪ *السوق هادئ الآن*\n\n"
             f"تم فحص `{total}` خبر — لا يوجد ما يستحق التنبيه.\n"
-            f"🕐 آخر تحديث: منذ {int(snap_age_min)} دقيقة\n\n"
+            f"🕐 آخر تحديث: {snap_age_str}\n\n"
             "*ماذا يعني هذا؟*\n"
             "• 🟢 السوق مستقر\n"
             "• 📊 لا تطورات كبيرة\n"
