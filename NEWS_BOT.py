@@ -2014,28 +2014,43 @@ def run_connectivity_test() -> Dict[str, Any]:
     except Exception as e:
         results["CryptoPanic"] = {"ok": False, "error": str(e)[:80]}
 
-    # Gemini
+    # Gemini (with retry for rate limit)
     if GEMINI_API_KEY:
-        start = time.time()
-        try:
-            test_article = {
-                "title": "Bitcoin reaches new all-time high above $100,000",
-                "summary": "BTC surged past $100K driven by ETF inflows.",
-                "coins": ["BTC"],
-            }
-            ai = gemini_analyze(test_article)
-            elapsed = int((time.time() - start) * 1000)
+        ai = None
+        elapsed = 0
+        last_error = ""
+        for attempt in range(3):
+            start = time.time()
+            try:
+                test_article = {
+                    "title": "Bitcoin reaches new all-time high above $100,000",
+                    "summary": "BTC surged past $100K driven by ETF inflows.",
+                    "coins": ["BTC"],
+                }
+                ai = gemini_analyze(test_article)
+                elapsed = int((time.time() - start) * 1000)
+                if ai:
+                    break  # success
+                last_error = "no result (likely rate limit)"
+                time.sleep(3)  # wait between retries
+            except Exception as e:
+                last_error = str(e)[:80]
+                time.sleep(2)
+
+        if ai:
             results["Gemini"] = {
-                "ok": ai is not None,
+                "ok": True,
                 "elapsed_ms": elapsed,
                 "model": GEMINI_MODEL,
+                "sample_sentiment": ai.get("sentiment", "?"),
             }
-            if ai:
-                results["Gemini"]["sample_sentiment"] = ai.get("sentiment", "?")
-        except Exception as e:
-            results["Gemini"] = {"ok": False, "error": str(e)[:80]}
+        else:
+            results["Gemini"] = {"ok": False, "error": last_error}
     else:
         results["Gemini"] = {"ok": False, "error": "GEMINI_API_KEY missing"}
+
+    # Add small delay before Claude to avoid hitting any global rate limits
+    time.sleep(1)
 
     # Claude (only test if key present, avoid burning quota otherwise)
     if CLAUDE_API_KEY:
