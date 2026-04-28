@@ -697,10 +697,119 @@ Rules:
 
 
 
-def claude_analyze(article: Dict) -> Optional[Dict]:
+# ── Binance Market Data ──
+BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr"
+
+# Coins → Binance USDT pairs (most liquid market)
+_BINANCE_SYMBOLS = {
+    "BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT",
+    "BNB": "BNBUSDT", "XRP": "XRPUSDT", "ADA": "ADAUSDT",
+    "DOGE": "DOGEUSDT", "AVAX": "AVAXUSDT", "DOT": "DOTUSDT",
+    "MATIC": "MATICUSDT", "LINK": "LINKUSDT", "UNI": "UNIUSDT",
+    "AAVE": "AAVEUSDT", "ATOM": "ATOMUSDT", "NEAR": "NEARUSDT",
+    "HBAR": "HBARUSDT", "ARB": "ARBUSDT", "OP": "OPUSDT",
+    "PEPE": "PEPEUSDT", "SHIB": "SHIBUSDT", "WIF": "WIFUSDT",
+    "BONK": "BONKUSDT", "ONDO": "ONDOUSDT", "PYTH": "PYTHUSDT",
+    "RENDER": "RENDERUSDT", "TAO": "TAOUSDT", "FET": "FETUSDT",
+    "HYPE": "HYPEUSDT", "SUI": "SUIUSDT", "APT": "APTUSDT",
+    "INJ": "INJUSDT", "SEI": "SEIUSDT", "TIA": "TIAUSDT",
+    "JUP": "JUPUSDT", "ENS": "ENSUSDT", "MKR": "MKRUSDT",
+    "LDO": "LDOUSDT", "GRT": "GRTUSDT", "FIL": "FILUSDT",
+    "LTC": "LTCUSDT", "BCH": "BCHUSDT", "TRX": "TRXUSDT",
+}
+
+
+def get_market_context(coin: str) -> Optional[Dict]:
+    """
+    Fetch real-time price + 24h stats from Binance.
+    Returns: {price, high_24h, low_24h, change_pct_24h, volume_usd_24h} or None
+    """
+    symbol = _BINANCE_SYMBOLS.get(coin.upper())
+    if not symbol:
+        return None
+
+    try:
+        r = _session.get(BINANCE_TICKER_URL, params={"symbol": symbol},
+                         timeout=(5, 10))
+        if r.status_code != 200:
+            log.debug(f"[MARKET] {symbol}: HTTP {r.status_code}")
+            return None
+        data = r.json()
+        price = float(data.get("lastPrice", 0))
+        high = float(data.get("highPrice", 0))
+        low = float(data.get("lowPrice", 0))
+        change_pct = float(data.get("priceChangePercent", 0))
+        volume_usd = float(data.get("quoteVolume", 0))
+
+        if price <= 0:
+            return None
+
+        return {
+            "coin": coin.upper(),
+            "symbol": symbol,
+            "price": price,
+            "high_24h": high,
+            "low_24h": low,
+            "change_pct_24h": change_pct,
+            "volume_usd_24h": volume_usd,
+        }
+    except Exception as e:
+        log.debug(f"[MARKET] {coin} fetch failed: {e}")
+        return None
+
+
+def get_market_context_multi(coins: List[str], max_coins: int = 3) -> List[Dict]:
+    """Fetch market context for top N coins from a list."""
+    contexts = []
+    for coin in coins[:max_coins]:
+        ctx = get_market_context(coin)
+        if ctx:
+            contexts.append(ctx)
+    return contexts
+
+
+def format_market_context_for_prompt(contexts: List[Dict]) -> str:
+    """Format market data as plain text for inclusion in AI prompts."""
+    if not contexts:
+        return "No market data available."
+
+    lines = ["REAL-TIME MARKET DATA (from Binance, NOW):"]
+    for ctx in contexts:
+        coin = ctx["coin"]
+        price = ctx["price"]
+        high = ctx["high_24h"]
+        low = ctx["low_24h"]
+        change = ctx["change_pct_24h"]
+        vol_m = ctx["volume_usd_24h"] / 1_000_000
+
+        # Smart formatting based on price magnitude
+        if price >= 100:
+            price_str = f"${price:,.2f}"
+            high_str = f"${high:,.2f}"
+            low_str = f"${low:,.2f}"
+        elif price >= 1:
+            price_str = f"${price:.4f}"
+            high_str = f"${high:.4f}"
+            low_str = f"${low:.4f}"
+        else:
+            price_str = f"${price:.8f}"
+            high_str = f"${high:.8f}"
+            low_str = f"${low:.8f}"
+
+        change_sign = "+" if change >= 0 else ""
+        lines.append(
+            f"  {coin}: {price_str} ({change_sign}{change:.2f}%) | "
+            f"24h Range: {low_str}-{high_str} | Vol: ${vol_m:.1f}M"
+        )
+
+    return "\n".join(lines)
+
+
+def claude_analyze(article: Dict, market_contexts: Optional[List[Dict]] = None) -> Optional[Dict]:
     """
     🟣 Claude — Strategic Analyst.
     Deep reasoning, historical context, risk assessment.
+    market_contexts: real-time price data from Binance (passed from caller)
     Returns: {scenario_ar, risks_ar, historical_ar, confidence}
     """
     if not CLAUDE_API_KEY:
@@ -717,6 +826,11 @@ def claude_analyze(article: Dict) -> Optional[Dict]:
     gemini_sentiment = gemini_result.get("sentiment", "unknown")
     gemini_impact = gemini_result.get("impact", "unknown")
 
+    # Format market data for prompt
+    market_section = ""
+    if market_contexts:
+        market_section = f"\n\n{format_market_context_for_prompt(market_contexts)}\n"
+
     prompt = f"""You are a senior crypto market strategist. Analyze this news with DEEP reasoning.
 
 NEWS:
@@ -728,7 +842,7 @@ USER_PORTFOLIO_AFFECTED: {portfolio_str}
 PRIOR ANALYSIS (Gemini):
 - Sentiment: {gemini_sentiment}
 - Impact: {gemini_impact}
-
+{market_section}
 YOUR TASK: Provide strategic analysis. Reply with ONLY this JSON (no markdown, no code fences):
 
 {{
@@ -739,7 +853,9 @@ YOUR TASK: Provide strategic analysis. Reply with ONLY this JSON (no markdown, n
   "agree_with_gemini": true OR false
 }}
 
-Be specific. Use price levels if relevant. Mention specific dates/events if relevant."""
+CRITICAL: If market data is provided above, USE THE REAL CURRENT PRICES in your scenario.
+Do NOT invent price levels — use ONLY what's shown in REAL-TIME MARKET DATA section above.
+If no market data, write scenarios in % terms (e.g. '+5%') without specific dollar amounts."""
 
     headers = {
         "Content-Type": "application/json",
@@ -811,11 +927,12 @@ Be specific. Use price levels if relevant. Mention specific dates/events if rele
     }
 
 
-def openai_analyze(article: Dict) -> Optional[Dict]:
+def openai_analyze(article: Dict, market_contexts: Optional[List[Dict]] = None) -> Optional[Dict]:
     """
     🔵 OpenAI GPT-4o — Market Voice / Execution Advisor.
-    Specific actionable recommendations + price levels.
-    Returns: {action_ar, levels, time_window_ar, conviction}
+    Specific actionable recommendations + price levels based on REAL market data.
+    market_contexts: real-time price data from Binance (passed from caller)
+    Returns: {action_ar, levels, time_window_ar, conviction, market_data}
     """
     if not OPENAI_API_KEY:
         return None
@@ -839,6 +956,25 @@ def openai_analyze(article: Dict) -> Optional[Dict]:
         context_lines.append(f"Claude confidence: {claude_result.get('confidence', 'N/A')}")
     context_str = "\n".join(context_lines)
 
+    # Format market data for prompt (CRITICAL for accurate recommendations)
+    market_section = ""
+    if market_contexts:
+        market_section = f"\n{format_market_context_for_prompt(market_contexts)}\n"
+        price_rule = """
+CRITICAL PRICE RULES:
+- USE ONLY the prices shown above in REAL-TIME MARKET DATA section
+- DO NOT invent or guess price levels — they MUST come from the data above
+- For support: use the 24h low or near it
+- For resistance: use the 24h high or near it
+- For stop_loss: use a value below the 24h low
+- ALL price values must be plain numbers (e.g. 76490 not "$76,490")"""
+    else:
+        price_rule = """
+NO MARKET DATA PROVIDED:
+- Set support, resistance, stop_loss ALL to null
+- Give percentage-based advice instead (e.g. "stop loss 5% below entry")
+- DO NOT invent specific dollar amounts"""
+
     prompt = f"""You are a crypto trading desk advisor. Give SPECIFIC actionable advice.
 
 NEWS:
@@ -849,22 +985,23 @@ USER_PORTFOLIO_AFFECTED: {portfolio_str}
 
 EXISTING ANALYSIS:
 {context_str}
+{market_section}{price_rule}
 
 YOUR TASK: Practical execution recommendations. Reply with ONLY this JSON:
 
 {{
-  "action_ar": "1-3 توصيات تنفيذية محددة بالعربي (مثلاً: 'لا تبيع بانيك', 'راقب stop loss عند X', 'احتفظ')",
+  "action_ar": "1-3 توصيات تنفيذية محددة بالعربي",
   "levels": {{
-    "support": "price level OR null",
-    "resistance": "price level OR null",
-    "stop_loss": "price level OR null"
+    "support": number OR null,
+    "resistance": number OR null,
+    "stop_loss": number OR null
   }},
-  "time_window_ar": "متى يجب اتخاذ القرار (مثلاً: 'خلال 4-6 ساعات قبل ECB' أو 'لا داعي للعجلة')",
+  "time_window_ar": "متى يجب اتخاذ القرار",
   "conviction": "high OR medium OR low",
   "primary_coin_affected": "ticker OR 'multiple'"
 }}
 
-Be DECISIVE but never financial advice. Use specific levels when news mentions prices."""
+Be DECISIVE but never financial advice."""
 
     headers = {
         "Content-Type": "application/json",
@@ -933,6 +1070,7 @@ Be DECISIVE but never financial advice. Use specific levels when news mentions p
         "time_window_ar":        parsed.get("time_window_ar", ""),
         "conviction":            str(parsed.get("conviction", "medium")).lower(),
         "primary_coin_affected": parsed.get("primary_coin_affected", ""),
+        "market_data":           market_contexts or [],  # store for display
     }
 
 
@@ -1060,13 +1198,16 @@ def enrich_with_ai(articles: List[Dict],
             log.info(f"[AI] Phase 2a (Council): {len(council_targets)} articles")
             for a in council_targets:
                 try:
+                    # Fetch real-time market context for this article's coins
+                    article_coins = a.get("coins", [])
+                    market_ctx = get_market_context_multi(article_coins, max_coins=3)
                     if CLAUDE_API_KEY:
-                        clde = claude_analyze(a)
+                        clde = claude_analyze(a, market_contexts=market_ctx)
                         if clde:
                             a["claude"] = clde
                         time.sleep(0.5)
                     if OPENAI_API_KEY:
-                        oai = openai_analyze(a)
+                        oai = openai_analyze(a, market_contexts=market_ctx)
                         if oai:
                             a["openai"] = oai
                         time.sleep(0.3)
@@ -1077,8 +1218,10 @@ def enrich_with_ai(articles: List[Dict],
             log.info(f"[AI] Phase 2b (Deep): {len(deep_targets)} articles")
             for a in deep_targets:
                 try:
+                    article_coins = a.get("coins", [])
+                    market_ctx = get_market_context_multi(article_coins, max_coins=2)
                     if CLAUDE_API_KEY:
-                        clde = claude_analyze(a)
+                        clde = claude_analyze(a, market_contexts=market_ctx)
                         if clde:
                             a["claude"] = clde
                         time.sleep(0.3)
@@ -1340,25 +1483,77 @@ def format_council_alert(a: Dict) -> str:
         lines.append("━━━━━━━━━━━━━━━━━━━━")
         lines.append("")
         lines.append("🔵 *صوت السوق (GPT-4o):*")
+
+        # Show REAL market data first (from Binance)
+        market_data = oai.get("market_data", []) or []
+        if market_data:
+            lines.append("")
+            lines.append("   📊 *السعر الحالي (Binance):*")
+            for ctx in market_data[:3]:
+                coin = ctx.get("coin", "?")
+                price = ctx.get("price", 0)
+                change = ctx.get("change_pct_24h", 0)
+                high = ctx.get("high_24h", 0)
+                low = ctx.get("low_24h", 0)
+
+                # Format prices intelligently
+                if price >= 100:
+                    p_str = f"${price:,.2f}"
+                    h_str = f"${high:,.2f}"
+                    l_str = f"${low:,.2f}"
+                elif price >= 1:
+                    p_str = f"${price:.4f}"
+                    h_str = f"${high:.4f}"
+                    l_str = f"${low:.4f}"
+                else:
+                    p_str = f"${price:.6f}"
+                    h_str = f"${high:.6f}"
+                    l_str = f"${low:.6f}"
+
+                sign = "+" if change >= 0 else ""
+                arrow = "🟢" if change >= 0 else "🔴"
+                lines.append(f"   • {coin}: `{p_str}` {arrow} {sign}{change:.2f}%")
+                lines.append(f"     24h: `{l_str}` ↔ `{h_str}`")
+
         action = oai.get("action_ar", "")
         if action:
             lines.append(f"")
             lines.append(f"   🎯 *توصية تنفيذية:*")
             lines.append(f"   {action}")
 
-        # Price levels
+        # Price levels (now backed by real data)
         support = oai.get("support")
         resistance = oai.get("resistance")
         stop_loss = oai.get("stop_loss")
-        if any([support, resistance, stop_loss]):
+
+        def _fmt_level(val):
+            """Format level: handle int/float/string/null."""
+            if val is None or val == "null" or val == "":
+                return None
+            try:
+                num = float(val)
+                if num >= 100:
+                    return f"${num:,.2f}"
+                elif num >= 1:
+                    return f"${num:.4f}"
+                else:
+                    return f"${num:.6f}"
+            except (ValueError, TypeError):
+                return str(val)
+
+        s_str = _fmt_level(support)
+        r_str = _fmt_level(resistance)
+        sl_str = _fmt_level(stop_loss)
+
+        if any([s_str, r_str, sl_str]):
             lines.append(f"")
-            lines.append(f"   📈 *مستويات مهمة:*")
-            if support and support != "null":
-                lines.append(f"   • Support: `{support}`")
-            if resistance and resistance != "null":
-                lines.append(f"   • Resistance: `{resistance}`")
-            if stop_loss and stop_loss != "null":
-                lines.append(f"   • Stop Loss: `{stop_loss}`")
+            lines.append(f"   📈 *مستويات تداول:*")
+            if s_str:
+                lines.append(f"   • Support: `{s_str}`")
+            if r_str:
+                lines.append(f"   • Resistance: `{r_str}`")
+            if sl_str:
+                lines.append(f"   • Stop Loss: `{sl_str}`")
 
         time_window = oai.get("time_window_ar", "")
         if time_window:
@@ -2253,39 +2448,56 @@ async def cmd_council(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     target = candidates[0]
 
-    # Update progress message
+    # Update progress message — fetch market data first
     try:
         await msg.edit_text(
             f"🤝 *Council يحلل:*\n"
             f"_{target.get('title', '')[:80]}_\n\n"
-            "🟣 Claude يفكر...",
+            "📊 جلب أسعار Binance...",
             parse_mode="Markdown"
         )
     except Exception:
         pass
 
-    # Run Claude
+    # Step 1: Fetch real-time market context from Binance
+    target_coins = target.get("coins", [])
+    def _fetch_market():
+        return get_market_context_multi(target_coins, max_coins=3)
+
+    market_contexts = await loop.run_in_executor(None, _fetch_market)
+    log.info(f"[COUNCIL] fetched market data for {len(market_contexts)} coins")
+
+    # Step 2: Run Claude with market context
+    try:
+        await msg.edit_text(
+            f"🤝 *Council يحلل:*\n"
+            f"_{target.get('title', '')[:80]}_\n\n"
+            "🟣 Claude يفكر مع بيانات السوق...",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
     def _run_claude():
-        return claude_analyze(target)
+        return claude_analyze(target, market_contexts=market_contexts)
 
     clde = await loop.run_in_executor(None, _run_claude)
     if clde:
         target["claude"] = clde
 
-    # Update progress
+    # Step 3: Run OpenAI with market context
     try:
         await msg.edit_text(
             f"🤝 *Council يحلل:*\n"
             f"_{target.get('title', '')[:80]}_\n\n"
-            "🔵 GPT-4o يكتب التوصية...",
+            "🔵 GPT-4o يكتب التوصية مع الأسعار الحقيقية...",
             parse_mode="Markdown"
         )
     except Exception:
         pass
 
-    # Run OpenAI
     def _run_openai():
-        return openai_analyze(target)
+        return openai_analyze(target, market_contexts=market_contexts)
 
     oai = await loop.run_in_executor(None, _run_openai)
     if oai:
