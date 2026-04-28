@@ -515,30 +515,61 @@ def fetch_all_news() -> List[Dict]:
             seen.add(a["id"])
             unique.append(a)
 
-    # Filter by age (strict)
+    # Filter by age (strict + URL pattern check)
     now_ts = int(time.time())
     cutoff_ts = now_ts - (MAX_ARTICLE_AGE_HOURS * 3600)
+    now_dt = datetime.now(timezone.utc)
+    current_year = now_dt.year
+    current_month = now_dt.month
     fresh = []
     too_old_count = 0
     future_count = 0
+    url_old_count = 0
+
+    # Check article URL for date patterns (catches republished old articles)
+    # CoinDesk:    /policy/2026/04/28/article-slug
+    # The Block:   /post/123456 (no date in URL, ts is reliable)
+    # CoinTelegraph: /news/article-name (no date)
+    # Decrypt:     /article-slug (no date, ts is reliable)
+    # Common pattern: YYYY/MM/ in URL
+    url_date_re = re.compile(r"/(\d{4})/(\d{1,2})/")
 
     for a in unique:
         article_ts = a.get("ts", 0)
+        url = a.get("url", "")
+
         # Reject future timestamps (RSS bugs)
         if article_ts > now_ts + 300:  # allow 5min clock skew
             future_count += 1
             continue
-        # Reject too old
+        # Reject too old by timestamp
         if article_ts < cutoff_ts:
             too_old_count += 1
             continue
+
+        # Cross-check URL date if available
+        url_match = url_date_re.search(url)
+        if url_match:
+            try:
+                url_year = int(url_match.group(1))
+                url_month = int(url_match.group(2))
+                # Reject if URL date is older than ~1 month (republished article)
+                month_diff = (current_year - url_year) * 12 + (current_month - url_month)
+                if month_diff > 1:
+                    url_old_count += 1
+                    log.debug(f"[FETCH] reject republished: {url[:60]}")
+                    continue
+            except (ValueError, AttributeError):
+                pass
+
         fresh.append(a)
 
     # Sort newest first
     fresh.sort(key=lambda x: x.get("ts", 0), reverse=True)
 
     log.info(f"[FETCH] total: {len(all_articles)}, unique: {len(unique)}, "
-             f"fresh: {len(fresh)}, too_old: {too_old_count}, future: {future_count}")
+             f"fresh: {len(fresh)}, too_old: {too_old_count}, "
+             f"future: {future_count}, republished: {url_old_count}")
     return fresh
 
 
@@ -614,6 +645,117 @@ def filter_by_portfolio(articles: List[Dict],
 # ══════════════════════════════════════════════════════════════════
 # 6. GEMINI AI ANALYZER
 # ══════════════════════════════════════════════════════════════════
+
+def gemini_freshness_check(article: Dict) -> Optional[Dict]:
+    """
+    🕐 Freshness Validator — uses Gemini to detect republished old news.
+
+    RSS feeds sometimes republish old articles with new pubDate.
+    This check asks AI: "Is this happening NOW or is it a summary of past events?"
+
+    Returns: {"is_fresh": bool, "reason_ar": str, "confidence": str} or None
+    """
+    if not GEMINI_API_KEY:
+        return None
+
+    title = article.get("title", "")
+    summary = article.get("summary", "")[:300]
+
+    # Get current date for context
+    now_dt = datetime.now(TZ_RIYADH)
+    current_date_str = now_dt.strftime("%B %Y")  # e.g. "April 2026"
+
+    prompt = f"""You are a news freshness validator. Today's date is {current_date_str}.
+
+NEWS HEADLINE:
+TITLE: {title}
+SUMMARY: {summary}
+
+YOUR TASK: Determine if this is genuinely BREAKING NEWS happening NOW (this week),
+OR if it's a republished/summary article about events from MONTHS AGO.
+
+RED FLAGS for OLD news (republished):
+- Mentions specific past events (e.g. "SEC approved XRP ETF" - this happened in 2025)
+- Uses past tense for major events ("SEC approved", "Fed cut rates")
+- "Anniversary of X" or "Looking back at X"
+- Generic explainer/educational content
+- Uses phrases like "earlier this year", "last quarter"
+
+GREEN FLAGS for FRESH news:
+- "Today", "this morning", "just announced", "breaking"
+- Specific recent dates within last 7 days
+- Live market reactions ("BTC drops to $X after announcement")
+- Forward-looking statements about upcoming events
+
+Reply with ONLY this JSON (no markdown, no code fences):
+
+{{
+  "is_fresh": true OR false,
+  "reason_ar": "سبب القرار في جملة واحدة قصيرة بالعربي",
+  "confidence": "high OR medium OR low"
+}}
+
+CRITICAL: When in doubt, mark as fresh (false negatives are worse than false positives).
+Only mark as NOT fresh when you're confident it's a republished old story."""
+
+    url = f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent"
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,  # Low temp for consistent decisions
+            "maxOutputTokens": 200,
+        }
+    }
+
+    try:
+        r = _session.post(url, headers=headers, json=body, timeout=(10, 20))
+    except Exception as e:
+        log.warning(f"[FRESH] request failed: {type(e).__name__}: {e}")
+        return None
+
+    if r.status_code != 200:
+        if r.status_code == 429:
+            log.info("[FRESH] rate limit, skipping check")
+        else:
+            log.warning(f"[FRESH] HTTP {r.status_code}")
+        return None
+
+    try:
+        data = r.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except (KeyError, IndexError, ValueError) as e:
+        log.warning(f"[FRESH] response parse: {e}")
+        return None
+
+    # Strip code fences
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```\s*$", "", text)
+    text = text.strip()
+
+    parsed = None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return None
+
+    if not parsed or "is_fresh" not in parsed:
+        return None
+
+    return {
+        "is_fresh":   bool(parsed.get("is_fresh", True)),  # default to fresh if unclear
+        "reason_ar":  parsed.get("reason_ar", ""),
+        "confidence": str(parsed.get("confidence", "medium")).lower(),
+    }
+
 
 def gemini_analyze(article: Dict) -> Optional[Dict]:
     """
@@ -1174,8 +1316,9 @@ def enrich_with_ai(articles: List[Dict],
     """
     Run AI analysis on relevant articles using Council pattern.
 
-    Phase 1 (always): Gemini analyzes all candidates
-    Phase 2 (council): Claude + OpenAI for important ones (limited!)
+    Phase 0 (NEW): Freshness validation — reject republished old news
+    Phase 1: Gemini analyzes fresh candidates
+    Phase 2: Council (Claude + OpenAI) for important ones
 
     NOTE: Council in pipeline is conservative (saves quota).
     For full council on a specific article, use /council command.
@@ -1183,9 +1326,46 @@ def enrich_with_ai(articles: List[Dict],
     candidates = [a for a in articles if should_analyze(a)]
     candidates = candidates[:max_to_analyze]
 
+    # ─────────────────────────────────────────────────
+    # Phase 0: Freshness Validation (NEW in v2.4)
+    # Reject articles that are republished old news
+    # ─────────────────────────────────────────────────
+    log.info(f"[AI] Phase 0 (Freshness): checking {len(candidates)} articles...")
+    fresh_candidates = []
+    rejected_stale = 0
+
+    for a in candidates:
+        try:
+            check = gemini_freshness_check(a)
+            if check is None:
+                # If freshness check fails, allow the article (don't lose news)
+                fresh_candidates.append(a)
+                continue
+
+            a["freshness"] = check  # store for debugging
+
+            # Reject only if explicitly marked NOT fresh with high/medium confidence
+            if not check["is_fresh"] and check["confidence"] in ("high", "medium"):
+                rejected_stale += 1
+                log.info(f"[FRESH] ❌ REJECTED: {a.get('title','?')[:60]}")
+                log.info(f"[FRESH]    reason: {check.get('reason_ar','?')[:80]}")
+                continue
+
+            fresh_candidates.append(a)
+            time.sleep(0.4)  # rate limit protection
+        except Exception as e:
+            log.warning(f"[FRESH] error on {a.get('title','?')[:40]}: {e}")
+            fresh_candidates.append(a)  # allow on error
+
+    log.info(f"[AI] Freshness: {len(fresh_candidates)} fresh, "
+             f"{rejected_stale} rejected as old/republished")
+
+    # Now use only fresh candidates for the rest of the pipeline
+    candidates = fresh_candidates
+
     log.info(f"[AI] Phase 1 (Gemini): {len(candidates)} articles...")
 
-    # Phase 1: Gemini for all candidates
+    # Phase 1: Gemini for all FRESH candidates
     gemini_success = 0
     for a in candidates:
         try:
@@ -2525,19 +2705,27 @@ async def cmd_council(u: Update, c: ContextTypes.DEFAULT_TYPE):
         articles = [a for a in articles if filter_coin in a.get("coins", [])]
 
     # Find highest-priority article (must have AI analysis already)
+    # Filter out stale articles (rejected by freshness validator)
+    def _is_fresh(a):
+        fr = a.get("freshness")
+        if not fr:
+            return True  # no check = allow
+        return fr.get("is_fresh", True) or fr.get("confidence") == "low"
+
     candidates = [
         a for a in articles
-        if a.get("ai", {}).get("impact") == "high"
+        if a.get("ai", {}).get("impact") == "high" and _is_fresh(a)
     ]
     if not candidates:
         candidates = [
             a for a in articles
             if a.get("is_portfolio_relevant", False) and a.get("ai")
+            and _is_fresh(a)
         ]
     if not candidates:
         candidates = [
             a for a in articles
-            if a.get("ai", {}).get("impact") == "medium"
+            if a.get("ai", {}).get("impact") == "medium" and _is_fresh(a)
         ]
 
     if not candidates:
