@@ -61,7 +61,16 @@ DCA_DATA_DIR = os.environ.get("DCA_DATA_DIR", "/data").rstrip("/")
 
 # ── API Endpoints ──
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
-GEMINI_MODEL = "gemini-2.5-flash"
+
+# Try models in order; first one that works wins. Cached in memory.
+GEMINI_MODELS = [
+    "gemini-2.0-flash",       # widely available, free tier
+    "gemini-2.0-flash-exp",   # experimental (sometimes free)
+    "gemini-1.5-flash",       # legacy fallback
+    "gemini-1.5-flash-latest",
+    "gemini-pro",             # last resort
+]
+_active_gemini_model: Optional[str] = None  # set on first success
 
 RSS_FEEDS = {
     "CoinDesk":      "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -70,7 +79,9 @@ RSS_FEEDS = {
 }
 
 COINGECKO_NEWS_URL  = "https://api.coingecko.com/api/v3/news"
+COINGECKO_RSS_URL   = "https://www.coingecko.com/en/news.rss"
 CRYPTOPANIC_URL     = "https://cryptopanic.com/api/v1/posts/"
+CRYPTOPANIC_FREE_URL = "https://cryptopanic.com/api/free/v1/posts/"
 
 # ── Limits ──
 MAX_ARTICLE_AGE_HOURS = 4
@@ -345,75 +356,94 @@ def fetch_rss_feed(name: str, url: str) -> List[Dict]:
 
 
 def fetch_coingecko_news() -> List[Dict]:
-    """Fetch news from CoinGecko News API."""
+    """
+    Fetch news from CoinGecko News API.
+    Falls back to RSS if API unavailable (free tier was deprecated mid-2025).
+    """
     headers = {}
     if COINGECKO_KEY:
         headers["x-cg-demo-api-key"] = COINGECKO_KEY
 
+    # Try API first (works with paid keys)
     data = safe_request("GET", COINGECKO_NEWS_URL, headers=headers,
                         timeout=(5, 15))
-    if not data or not isinstance(data, dict):
-        return []
 
-    articles = []
-    items = data.get("data", [])
-    for item in items[:MAX_ARTICLES_PER_FETCH]:
-        try:
-            attrs = item.get("attributes", {}) or item
-            title = attrs.get("title", "").strip()
-            desc = _strip_html(attrs.get("description", ""))
-            link = attrs.get("url", "")
-            ts = attrs.get("updated_at") or attrs.get("created_at")
-
-            if isinstance(ts, str):
-                pub_ts = _parse_rss_date(ts)
-            elif isinstance(ts, (int, float)):
-                pub_ts = int(ts)
-            else:
-                pub_ts = int(time.time())
-
-            if not title or not link:
+    if data and isinstance(data, dict) and data.get("data"):
+        articles = []
+        for item in data.get("data", [])[:MAX_ARTICLES_PER_FETCH]:
+            try:
+                attrs = item.get("attributes", {}) or item
+                title = attrs.get("title", "").strip()
+                desc = _strip_html(attrs.get("description", ""))
+                link = attrs.get("url", "")
+                ts = attrs.get("updated_at") or attrs.get("created_at")
+                if isinstance(ts, str):
+                    pub_ts = _parse_rss_date(ts)
+                elif isinstance(ts, (int, float)):
+                    pub_ts = int(ts)
+                else:
+                    pub_ts = int(time.time())
+                if not title or not link:
+                    continue
+                articles.append({
+                    "title":   title,
+                    "summary": desc[:500],
+                    "url":     link,
+                    "source":  "CoinGecko",
+                    "ts":      pub_ts,
+                    "id":      hashlib.md5(link.encode()).hexdigest()[:16],
+                })
+            except Exception:
                 continue
+        if articles:
+            log.info(f"[CG_NEWS] API: {len(articles)} articles")
+            return articles
 
-            articles.append({
-                "title":   title,
-                "summary": desc[:500],
-                "url":     link,
-                "source":  "CoinGecko",
-                "ts":      pub_ts,
-                "id":      hashlib.md5(link.encode()).hexdigest()[:16],
-            })
-        except Exception:
-            continue
-
-    log.info(f"[CG_NEWS] {len(articles)} articles")
-    return articles
+    # Fallback: RSS feed (always works, no auth)
+    log.info("[CG_NEWS] API failed, trying RSS fallback")
+    rss_articles = fetch_rss_feed("CoinGecko", COINGECKO_RSS_URL)
+    return rss_articles
 
 
 def fetch_cryptopanic() -> List[Dict]:
-    """Fetch news from CryptoPanic API."""
-    params = {"public": "true", "filter": "hot"}
+    """
+    Fetch news from CryptoPanic.
+    With key: uses authenticated endpoint
+    Without key: tries free endpoint (limited data but no auth)
+    """
     if CRYPTOPANIC_KEY:
-        params["auth_token"] = CRYPTOPANIC_KEY
+        # Authenticated mode
+        params = {"auth_token": CRYPTOPANIC_KEY, "filter": "hot"}
+        data = safe_request("GET", CRYPTOPANIC_URL, params=params,
+                            timeout=(5, 15))
+    else:
+        # Free public mode (CryptoPanic restricted public endpoint mid-2025)
+        # Try free endpoint with minimal params
+        params = {"public": "true"}
+        data = safe_request("GET", CRYPTOPANIC_FREE_URL, params=params,
+                            timeout=(5, 15))
+        # If free endpoint also fails, return empty (not critical)
+        if not data or (isinstance(data, dict) and "_auth_error" in data):
+            log.info("[CP] free endpoint unavailable, skipping")
+            return []
 
-    data = safe_request("GET", CRYPTOPANIC_URL, params=params,
-                        timeout=(5, 15))
     if not data or not isinstance(data, dict):
+        return []
+    if "_auth_error" in data:
+        log.warning(f"[CP] auth error {data.get('_auth_error')}")
         return []
 
     articles = []
     for item in data.get("results", [])[:MAX_ARTICLES_PER_FETCH]:
         try:
             title = item.get("title", "").strip()
-            link = item.get("url", "")
+            link = item.get("url", "") or item.get("source", {}).get("url", "")
             ts_str = item.get("published_at", "")
             pub_ts = _parse_rss_date(ts_str) if ts_str else int(time.time())
 
-            # CryptoPanic provides currency tags directly
             currencies = item.get("currencies", [])
             tagged_coins = [c.get("code", "").upper() for c in currencies if c.get("code")]
 
-            # Pre-classified sentiment (if available)
             votes = item.get("votes", {})
             cp_sentiment = "neutral"
             if votes.get("positive", 0) > votes.get("negative", 0) * 1.5:
@@ -426,7 +456,7 @@ def fetch_cryptopanic() -> List[Dict]:
 
             articles.append({
                 "title":   title,
-                "summary": "",  # CryptoPanic doesn't include summaries in free tier
+                "summary": "",
                 "url":     link,
                 "source":  "CryptoPanic",
                 "ts":      pub_ts,
@@ -556,11 +586,69 @@ def filter_by_portfolio(articles: List[Dict],
 # 6. GEMINI AI ANALYZER
 # ══════════════════════════════════════════════════════════════════
 
+def _try_gemini_model(model_name: str, prompt: str) -> Optional[Tuple[Optional[Dict], str]]:
+    """
+    Try one specific Gemini model. Returns (result, error_msg).
+    result is None if failed, error_msg explains why.
+    """
+    url = f"{GEMINI_BASE}/models/{model_name}:generateContent"
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": 500,
+            "responseMimeType": "application/json",
+        }
+    }
+
+    # Direct request to capture exact error
+    try:
+        r = _session.post(url, headers=headers, json=body,
+                          timeout=(10, GEMINI_TIMEOUT))
+        if r.status_code == 200:
+            data = r.json()
+            candidates = data.get("candidates", [])
+            if not candidates:
+                return None, "no candidates returned"
+            parts = candidates[0].get("content", {}).get("parts", [])
+            if not parts:
+                return None, "no parts in response"
+            text = parts[0].get("text", "").strip()
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+            try:
+                result = json.loads(text)
+                if "sentiment" in result and "impact" in result:
+                    return result, "ok"
+                return None, "missing required fields"
+            except json.JSONDecodeError as e:
+                return None, f"JSON parse: {e}"
+        elif r.status_code == 404:
+            return None, f"model not found (404)"
+        elif r.status_code in (401, 403):
+            return None, f"auth error ({r.status_code})"
+        elif r.status_code == 429:
+            return None, "rate limit (429)"
+        else:
+            err_text = (r.text or "")[:120]
+            return None, f"HTTP {r.status_code}: {err_text}"
+    except requests.exceptions.Timeout:
+        return None, "timeout"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {str(e)[:80]}"
+
+
 def gemini_analyze(article: Dict) -> Optional[Dict]:
     """
-    Send article to Gemini for analysis.
+    Send article to Gemini for analysis. Tries multiple models with fallback.
     Returns: {sentiment, impact, reasoning_ar, summary_ar, action_hint}
     """
+    global _active_gemini_model
+
     if not GEMINI_API_KEY:
         return None
 
@@ -591,64 +679,47 @@ Rules:
 - All Arabic text should be clear and concise
 - DO NOT include markdown code fences or any text outside the JSON"""
 
-    url = f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent"
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY,
-    }
-    body = {
-        "contents": [{
-            "parts": [{"text": prompt}]
-        }],
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 500,
-            "responseMimeType": "application/json",
-        }
-    }
-
-    response = safe_request("POST", url, headers=headers, json_body=body,
-                            timeout=(10, GEMINI_TIMEOUT), retries=1)
-    if not response:
-        return None
-    if isinstance(response, dict) and "_auth_error" in response:
-        log.warning(f"[GEMINI] auth error {response['_auth_error']}")
-        return None
-    if not isinstance(response, dict):
-        return None
-
-    try:
-        candidates = response.get("candidates", [])
-        if not candidates:
+    # Try cached working model first
+    if _active_gemini_model:
+        result, err = _try_gemini_model(_active_gemini_model, prompt)
+        if result:
+            return {
+                "sentiment":     result.get("sentiment", "neutral").lower(),
+                "impact":        result.get("impact", "low").lower(),
+                "reasoning_ar":  result.get("reasoning_ar", ""),
+                "summary_ar":    result.get("summary_ar", ""),
+                "action_hint":   result.get("action_hint", ""),
+            }
+        # If cached model fails with auth/rate, don't try others
+        if "auth error" in err or "rate limit" in err:
+            log.warning(f"[GEMINI] {_active_gemini_model}: {err}")
             return None
-        parts = candidates[0].get("content", {}).get("parts", [])
-        if not parts:
-            return None
-        text = parts[0].get("text", "").strip()
+        # Else, model became unavailable — clear cache and try fallback
+        log.warning(f"[GEMINI] {_active_gemini_model} failed: {err}, trying fallback")
+        _active_gemini_model = None
 
-        # Strip code fences if present
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
+    # Try each model in order
+    last_err = "no models tried"
+    for model in GEMINI_MODELS:
+        result, err = _try_gemini_model(model, prompt)
+        if result:
+            _active_gemini_model = model
+            log.info(f"[GEMINI] using model: {model}")
+            return {
+                "sentiment":     result.get("sentiment", "neutral").lower(),
+                "impact":        result.get("impact", "low").lower(),
+                "reasoning_ar":  result.get("reasoning_ar", ""),
+                "summary_ar":    result.get("summary_ar", ""),
+                "action_hint":   result.get("action_hint", ""),
+            }
+        last_err = f"{model}: {err}"
+        # If auth error, all models will fail — stop
+        if "auth error" in err:
+            log.warning(f"[GEMINI] auth error — stopping all model attempts")
+            break
 
-        result = json.loads(text)
-
-        # Validate required fields
-        if "sentiment" not in result or "impact" not in result:
-            return None
-
-        return {
-            "sentiment":     result.get("sentiment", "neutral").lower(),
-            "impact":        result.get("impact", "low").lower(),
-            "reasoning_ar":  result.get("reasoning_ar", ""),
-            "summary_ar":    result.get("summary_ar", ""),
-            "action_hint":   result.get("action_hint", ""),
-        }
-    except json.JSONDecodeError as e:
-        log.warning(f"[GEMINI] JSON parse failed: {e}")
-        return None
-    except Exception as e:
-        log.warning(f"[GEMINI] error: {e}")
-        return None
+    log.warning(f"[GEMINI] all models failed. last: {last_err}")
+    return None
 
 
 def should_analyze(article: Dict) -> bool:
@@ -1076,7 +1147,7 @@ def run_connectivity_test() -> Dict[str, Any]:
             results["Gemini"] = {
                 "ok": ai is not None,
                 "elapsed_ms": elapsed,
-                "model": GEMINI_MODEL,
+                "model": _active_gemini_model or "(none worked)",
             }
             if ai:
                 results["Gemini"]["sample_sentiment"] = ai.get("sentiment", "?")
@@ -1237,6 +1308,199 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "⚠️ _تحليل آلي — ليس نصيحة مالية_"
     )
     await u.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_gemdebug(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Deep Gemini diagnostic — tries all 5 models with detailed errors."""
+    msg = await u.message.reply_text("⏳ تشخيص Gemini بكل النماذج...")
+
+    if not GEMINI_API_KEY:
+        await msg.delete()
+        await u.message.reply_text(
+            "❌ *GEMINI_API_KEY مفقود*\n\n"
+            "أضفه في Railway → Variables.",
+            parse_mode="Markdown"
+        )
+        return
+
+    loop = asyncio.get_event_loop()
+
+    def _run_full_diag():
+        results = []
+        test_prompt = """Analyze this and respond in JSON only.
+TITLE: Bitcoin reaches new ATH above $100K
+COINS: BTC
+
+Respond with: {"sentiment": "bullish", "impact": "high"}"""
+
+        # Test each model
+        for model in GEMINI_MODELS:
+            url = f"{GEMINI_BASE}/models/{model}:generateContent"
+            headers = {
+                "Content-Type": "application/json",
+                "x-goog-api-key": GEMINI_API_KEY,
+            }
+            body = {
+                "contents": [{"parts": [{"text": test_prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.3,
+                    "maxOutputTokens": 200,
+                },
+            }
+            start = time.time()
+            try:
+                r = _session.post(url, headers=headers, json=body,
+                                  timeout=(10, 30))
+                elapsed = int((time.time() - start) * 1000)
+                if r.status_code == 200:
+                    try:
+                        data = r.json()
+                        candidates = data.get("candidates", [])
+                        if candidates:
+                            text = candidates[0].get("content", {}).get(
+                                "parts", [{}])[0].get("text", "")[:60]
+                            results.append({
+                                "model": model, "ok": True,
+                                "ms": elapsed,
+                                "preview": text.replace("\n", " "),
+                            })
+                        else:
+                            results.append({
+                                "model": model, "ok": False,
+                                "ms": elapsed,
+                                "err": "no candidates",
+                            })
+                    except Exception as e:
+                        results.append({
+                            "model": model, "ok": False,
+                            "ms": elapsed,
+                            "err": f"parse: {str(e)[:40]}",
+                        })
+                else:
+                    err_body = (r.text or "")[:200]
+                    # Try to extract Google's error message
+                    try:
+                        err_json = r.json()
+                        err_msg = err_json.get("error", {}).get("message", "")
+                        err_body = err_msg[:120] if err_msg else err_body
+                    except Exception:
+                        pass
+                    results.append({
+                        "model": model, "ok": False,
+                        "ms": elapsed,
+                        "status": r.status_code,
+                        "err": err_body,
+                    })
+            except requests.exceptions.Timeout:
+                results.append({
+                    "model": model, "ok": False,
+                    "ms": int((time.time() - start) * 1000),
+                    "err": "timeout (>30s)",
+                })
+            except Exception as e:
+                results.append({
+                    "model": model, "ok": False,
+                    "ms": int((time.time() - start) * 1000),
+                    "err": f"{type(e).__name__}",
+                })
+
+        # Also test list-models endpoint to see what's actually available
+        try:
+            r = _session.get(
+                f"{GEMINI_BASE}/models",
+                headers={"x-goog-api-key": GEMINI_API_KEY},
+                timeout=(5, 15),
+            )
+            available = []
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                    for m in data.get("models", []):
+                        name = m.get("name", "").replace("models/", "")
+                        methods = m.get("supportedGenerationMethods", [])
+                        if "generateContent" in methods:
+                            available.append(name)
+                except Exception:
+                    pass
+            return results, available
+        except Exception:
+            return results, []
+
+    results, available = await loop.run_in_executor(None, _run_full_diag)
+
+    # Build report
+    key_preview = (f"{GEMINI_API_KEY[:8]}...{GEMINI_API_KEY[-4:]}"
+                   if len(GEMINI_API_KEY) > 12 else "(short)")
+
+    lines = [
+        "🔬 *Gemini Deep Diagnostic*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🔑 Key length: `{len(GEMINI_API_KEY)}` chars",
+        f"🔑 Preview: `{key_preview}`",
+        "",
+        "*اختبار النماذج:*",
+    ]
+
+    any_ok = False
+    for r in results:
+        model = r["model"]
+        ms = r.get("ms", 0)
+        if r["ok"]:
+            any_ok = True
+            preview = r.get("preview", "")[:50]
+            lines.append(f"✅ `{model}` ({ms}ms)")
+            if preview:
+                lines.append(f"   _{preview}_")
+        else:
+            err = r.get("err", "?")[:80]
+            status = r.get("status", "")
+            status_str = f" [{status}]" if status else ""
+            lines.append(f"❌ `{model}`{status_str}")
+            lines.append(f"   _{err}_")
+
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+
+    # Smart diagnosis
+    if any_ok:
+        lines.append("🎯 *النتيجة:* بعض النماذج تعمل ✅")
+        lines.append("   استخدم البوت بشكل طبيعي.")
+    else:
+        # Analyze failure pattern
+        all_403 = all(r.get("status") == 403 for r in results if not r["ok"])
+        all_400 = all(r.get("status") == 400 for r in results if not r["ok"])
+        all_404 = all(r.get("status") == 404 for r in results if not r["ok"])
+        any_quota = any("quota" in str(r.get("err", "")).lower() for r in results)
+        any_invalid = any("invalid" in str(r.get("err", "")).lower() for r in results)
+
+        if all_403 or any_invalid:
+            lines.append("🩺 *التشخيص:* مشكلة authentication")
+            lines.append("   • الـ API key غير صحيح أو محظور")
+            lines.append("   • تحقّق من aistudio.google.com/apikey")
+        elif any_quota:
+            lines.append("🩺 *التشخيص:* تجاوز الحد المجاني")
+            lines.append("   • انتظر 24 ساعة")
+            lines.append("   • أو فعّل billing في Google Cloud")
+        elif all_404:
+            lines.append("🩺 *التشخيص:* النماذج غير متوفرة")
+            lines.append("   • قد تكون قائمة النماذج تغيّرت")
+        elif all_400:
+            lines.append("🩺 *التشخيص:* request format غلط")
+        else:
+            lines.append("🩺 *التشخيص:* مشكلة شبكة أو timeout")
+
+    # Show available models if we got them
+    if available:
+        lines.append("")
+        lines.append(f"📋 *النماذج المتاحة لمفتاحك* ({len(available)}):")
+        # Show first 8 only
+        for m in available[:8]:
+            lines.append(f"   • `{m}`")
+        if len(available) > 8:
+            lines.append(f"   _... و {len(available)-8} أخرى_")
+
+    await msg.delete()
+    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1534,7 +1798,8 @@ def _print_banner():
     print("=" * 70)
     print(f"  AI Engine        :")
     print(f"    🤖 Gemini      : {gem_status}")
-    print(f"    Model          : {GEMINI_MODEL}")
+    print(f"    Models         : {len(GEMINI_MODELS)} fallbacks")
+    print(f"      → {GEMINI_MODELS[0]} (preferred)")
     print(f"  المصادر         :")
     print(f"    📡 CoinDesk    : RSS")
     print(f"    📡 The Block   : RSS")
@@ -1569,6 +1834,7 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("test", cmd_test))
+    app.add_handler(CommandHandler("gemdebug", cmd_gemdebug))
     app.add_handler(CommandHandler("news", cmd_news))
     app.add_handler(CommandHandler("breaking", cmd_breaking))
     app.add_handler(CommandHandler("sentiment", cmd_sentiment))
