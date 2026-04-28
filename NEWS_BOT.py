@@ -2342,35 +2342,87 @@ async def cmd_breaking(u: Update, c: ContextTypes.DEFAULT_TYPE):
     snapshot = storage_load("news_latest.json", {})
     articles = snapshot.get("articles", [])
 
-    if not articles:
+    # Check freshness — refresh if older than 30 min
+    snap_age_min = 999
+    if snapshot.get("timestamp"):
+        try:
+            snap_dt = datetime.fromisoformat(snapshot["timestamp"])
+            snap_age_min = (datetime.now(TZ_RIYADH) - snap_dt).total_seconds() / 60
+        except Exception:
+            pass
+
+    # Refetch if no articles, no AI, or older than 30 min
+    has_ai = any(a.get("ai") for a in articles)
+    if not articles or not has_ai or snap_age_min > 30:
+        try:
+            await msg.edit_text("⏳ جلب الأخبار الحديثة + تحليل AI...")
+        except Exception:
+            pass
         loop = asyncio.get_event_loop()
         articles = await loop.run_in_executor(None, run_news_pipeline, True)
 
-    breaking = [a for a in articles
-                if a.get("ai", {}).get("impact") == "high"]
+    # Find high-impact news
+    high = [a for a in articles
+            if a.get("ai", {}).get("impact") == "high"]
+
+    # Find portfolio-relevant news
+    portfolio_news = [a for a in articles
+                      if a.get("is_portfolio_relevant", False)
+                      and a not in high]
+
+    # Find medium-impact news (fallback if no high)
+    medium = [a for a in articles
+              if a.get("ai", {}).get("impact") == "medium"
+              and a not in high and a not in portfolio_news]
 
     await msg.delete()
 
-    if not breaking:
+    # Decision tree
+    if high:
+        lines = [f"🚨 *أخبار عاجلة* ({len(high)})",
+                 f"🕐 {now_str()} · _آخر تحديث: منذ {int(snap_age_min)}د_",
+                 "━━━━━━━━━━━━━━━━━━━━",
+                 ""]
+        for a in high[:5]:
+            lines.append(format_article_brief(a))
+            lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("💡 لتحليل عميق بـ 3 خبراء AI:")
+        lines.append("`/council` — للخبر العاجل الأهم")
+
+    elif portfolio_news:
+        lines = [f"💼 *لا أخبار عاجلة، لكن {len(portfolio_news)} يخص محفظتك*",
+                 f"🕐 {now_str()}",
+                 "━━━━━━━━━━━━━━━━━━━━",
+                 ""]
+        for a in portfolio_news[:5]:
+            lines.append(format_article_brief(a))
+            lines.append("")
+
+    elif medium:
+        lines = [f"📰 *لا أخبار عاجلة، لكن {len(medium)} متوسط الأهمية*",
+                 f"🕐 {now_str()}",
+                 "━━━━━━━━━━━━━━━━━━━━",
+                 ""]
+        for a in medium[:5]:
+            lines.append(format_article_brief(a))
+            lines.append("")
+
+    else:
+        # Truly nothing relevant
+        total = len(articles)
         await u.message.reply_text(
-            "⚪ *لا توجد أخبار عاجلة الآن*\n\n"
-            "البوت لم يكتشف أي خبر عالي التأثير في آخر 4 ساعات.\n"
-            "هذا عادة *خبر جيد* — السوق هادئ.",
+            f"⚪ *السوق هادئ الآن*\n\n"
+            f"تم فحص `{total}` خبر — لا يوجد ما يستحق التنبيه.\n"
+            f"🕐 آخر تحديث: منذ {int(snap_age_min)} دقيقة\n\n"
+            "*ماذا يعني هذا؟*\n"
+            "• 🟢 السوق مستقر\n"
+            "• 📊 لا تطورات كبيرة\n"
+            "• ✅ لا داعي للقلق\n\n"
+            "💡 جرّب `/news` لرؤية كل الأخبار",
             parse_mode="Markdown"
         )
         return
-
-    lines = [f"🚨 *أخبار عاجلة* ({len(breaking)})",
-             f"🕐 {now_str()}",
-             "━━━━━━━━━━━━━━━━━━━━",
-             ""]
-    for a in breaking[:5]:
-        lines.append(format_article_brief(a))
-        lines.append("")
-
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("💡 لتحليل عميق بـ 3 خبراء AI:")
-    lines.append("`/council` — للخبر العاجل الأهم")
 
     await u.message.reply_text(
         "\n".join(lines),
