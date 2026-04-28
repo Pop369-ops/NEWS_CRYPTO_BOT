@@ -1207,7 +1207,7 @@ async def daily_digest_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "📰 *NEWS_CRYPTO_BOT v1.0*\n"
+        "📰 *NEWS CRYPTO BOT v1.0*\n"
         "_Smart Crypto News + AI Analysis_\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "*المصادر (5):*\n"
@@ -1215,7 +1215,7 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "📡 CoinGecko News + CryptoPanic\n\n"
         "*الميزات:*\n"
         "🤖 تحليل AI بـ Gemini (sentiment + impact)\n"
-        "💼 ربط مع محفظتك من DCA_BOT\n"
+        "💼 ربط مع محفظتك من DCA BOT\n"
         "🔔 تنبيهات تلقائية للأخبار المهمة\n"
         "📊 Sentiment overview لكل عملة\n"
         "📅 ملخص يومي تلقائي\n\n"
@@ -1277,10 +1277,10 @@ async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
     p = results.get("Portfolio", {})
     if p.get("ok"):
         coins_str = ", ".join(p.get("coins", [])[:8])
-        lines.append(f"✅ Portfolio (DCA_BOT): {p.get('coins_count')} عملة")
+        lines.append(f"✅ Portfolio (DCA): {p.get('coins_count')} عملة")
         lines.append(f"   `{coins_str}`")
     else:
-        lines.append(f"⚪ Portfolio: غير متصل (DCA_BOT data غير موجود)")
+        lines.append(f"⚪ Portfolio: غير متصل (DCA data غير موجود)")
 
     # Summary
     ok_sources = sum(1 for s in sources if results.get(s, {}).get("ok"))
