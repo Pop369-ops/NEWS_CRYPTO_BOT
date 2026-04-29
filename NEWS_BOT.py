@@ -1,15 +1,15 @@
 """
 ╔═══════════════════════════════════════════════════════════════════╗
-║                    NEWS_CRYPTO_BOT v1.0                           ║
-║       Smart Crypto News + AI Analysis Bot                        ║
+║                    NEWS_CRYPTO_BOT v2.2                           ║
+║    Smart Crypto News + AI Council + Massive Market Data          ║
 ║                                                                   ║
 ║  Features:                                                        ║
-║    📰 5 sources (CoinDesk, The Block, CoinGecko, CryptoPanic,    ║
-║                  CoinTelegraph)                                   ║
-║    🤖 Gemini AI analysis (sentiment + impact + reasoning)         ║
+║    📰 8 RSS + CoinGecko + CryptoPanic                            ║
+║    🤝 AI Council (Gemini + Claude + GPT-4o)                       ║
+║    💎 Massive.com (Polygon.io) institutional market data         ║
+║    📊 Top movers, large trades, OHLCV aggregates                  ║
 ║    🔗 Portfolio integration (reads DCA_BOT data)                  ║
-║    🔔 Smart alerts (breaking + important + daily digest)          ║
-║    📊 Per-coin sentiment tracking                                 ║
+║    🔔 Smart alerts (breaking + portfolio + daily digest)          ║
 ║    🌐 Arabic + English UI                                         ║
 ║                                                                   ║
 ║  للأغراض التعليمية فقط — ليس نصيحة مالية                          ║
@@ -53,6 +53,10 @@ CLAUDE_API_KEY     = os.environ.get("CLAUDE_API_KEY", "").strip()
 OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY", "").strip()
 CRYPTOPANIC_KEY    = os.environ.get("CRYPTOPANIC_KEY", "").strip()
 COINGECKO_KEY      = os.environ.get("COINGECKO_KEY", "").strip()
+# Massive.com (renamed from Polygon.io Oct 2025) — env var name kept
+# for backward compatibility. Plan: Currencies Starter ($49/mo) which
+# includes ALL crypto tickers + crypto trades + unlimited API calls.
+POLYGON_API_KEY    = os.environ.get("POLYGON_API_KEY", "").strip()
 
 # ── Storage Path ──
 DATA_DIR = os.environ.get("DATA_DIR", "/data").rstrip("/")
@@ -862,6 +866,209 @@ Rules:
 
 
 
+# ── Massive.com (Polygon.io) Market Data ──
+# Massive.com rebranded from Polygon.io in Oct 2025.
+# API endpoints still live at api.polygon.io and the same key works.
+# Plan: Currencies Starter ($49/mo) — All Crypto Tickers + Trades +
+# Unlimited API Calls + Real-time Data. Cross-exchange aggregated
+# pricing (more accurate than any single exchange).
+MASSIVE_BASE = "https://api.polygon.io"
+
+# Map our coin symbols to Massive crypto pairs (X:{from}{to} format).
+# Massive uses USD as quote currency, not USDT.
+_MASSIVE_SYMBOLS = {
+    "BTC":   "X:BTCUSD",   "ETH":  "X:ETHUSD",   "SOL":  "X:SOLUSD",
+    "BNB":   "X:BNBUSD",   "XRP":  "X:XRPUSD",   "ADA":  "X:ADAUSD",
+    "DOGE":  "X:DOGEUSD",  "AVAX": "X:AVAXUSD",  "DOT":  "X:DOTUSD",
+    "MATIC": "X:MATICUSD", "LINK": "X:LINKUSD",  "UNI":  "X:UNIUSD",
+    "AAVE":  "X:AAVEUSD",  "ATOM": "X:ATOMUSD",  "NEAR": "X:NEARUSD",
+    "HBAR":  "X:HBARUSD",  "ARB":  "X:ARBUSD",   "OP":   "X:OPUSD",
+    "PEPE":  "X:PEPEUSD",  "SHIB": "X:SHIBUSD",  "WIF":  "X:WIFUSD",
+    "BONK":  "X:BONKUSD",  "ONDO": "X:ONDOUSD",  "PYTH": "X:PYTHUSD",
+    "RENDER":"X:RENDERUSD","TAO":  "X:TAOUSD",   "FET":  "X:FETUSD",
+    "HYPE":  "X:HYPEUSD",  "SUI":  "X:SUIUSD",   "APT":  "X:APTUSD",
+    "INJ":   "X:INJUSD",   "SEI":  "X:SEIUSD",   "TIA":  "X:TIAUSD",
+    "JUP":   "X:JUPUSD",   "ENS":  "X:ENSUSD",   "MKR":  "X:MKRUSD",
+    "LDO":   "X:LDOUSD",   "GRT":  "X:GRTUSD",   "FIL":  "X:FILUSD",
+    "LTC":   "X:LTCUSD",   "BCH":  "X:BCHUSD",   "TRX":  "X:TRXUSD",
+}
+
+
+def _massive_request(path: str, params: Optional[Dict] = None,
+                     timeout=(5, 12)) -> Optional[Dict]:
+    """Generic Massive API request with auth. Returns parsed JSON or None."""
+    if not POLYGON_API_KEY:
+        return None
+    p = dict(params or {})
+    p["apiKey"] = POLYGON_API_KEY
+    try:
+        r = _session.get(MASSIVE_BASE + path, params=p, timeout=timeout)
+        if r.status_code != 200:
+            log.debug(f"[MASSIVE] {path} HTTP {r.status_code}")
+            return None
+        return r.json()
+    except Exception as e:
+        log.debug(f"[MASSIVE] {path} failed: {e}")
+        return None
+
+
+def massive_get_snapshot(coin: str) -> Optional[Dict]:
+    """
+    Cross-exchange aggregated snapshot for a coin (price + 24h stats).
+    Returns same shape as get_market_context() for compatibility.
+    """
+    sym = _MASSIVE_SYMBOLS.get(coin.upper())
+    if not sym:
+        return None
+
+    data = _massive_request(
+        f"/v2/snapshot/locale/global/markets/crypto/tickers/{sym}"
+    )
+    if not data or data.get("status") != "OK":
+        return None
+
+    ticker = data.get("ticker") or {}
+    day = ticker.get("day") or {}
+    last_trade = ticker.get("lastTrade") or {}
+
+    price = float(last_trade.get("p") or day.get("c") or 0)
+    if price <= 0:
+        return None
+
+    high = float(day.get("h") or 0)
+    low = float(day.get("l") or 0)
+    change_pct = float(ticker.get("todaysChangePerc") or 0)
+    # Volume in coin units → convert to USD
+    vol_coin = float(day.get("v") or 0)
+    vol_usd = vol_coin * price
+
+    return {
+        "coin": coin.upper(),
+        "symbol": sym,
+        "price": price,
+        "high_24h": high,
+        "low_24h": low,
+        "change_pct_24h": change_pct,
+        "volume_usd_24h": vol_usd,
+        "source": "Massive",
+    }
+
+
+def massive_get_top_movers(direction: str = "gainers",
+                           limit: int = 10) -> List[Dict]:
+    """
+    Top crypto gainers or losers across the entire market.
+    direction: 'gainers' or 'losers'
+    """
+    if direction not in ("gainers", "losers"):
+        direction = "gainers"
+
+    data = _massive_request(
+        f"/v2/snapshot/locale/global/markets/crypto/{direction}"
+    )
+    if not data or data.get("status") != "OK":
+        return []
+
+    movers = []
+    for ticker in (data.get("tickers") or [])[:limit * 2]:
+        sym = ticker.get("ticker", "")
+        # X:BTCUSD → BTC
+        coin = sym.replace("X:", "").replace("USD", "")
+        if not coin or len(coin) > 10:
+            continue
+        day = ticker.get("day") or {}
+        change = float(ticker.get("todaysChangePerc") or 0)
+        price = float(day.get("c") or 0)
+        if price <= 0:
+            continue
+        vol_usd = float(day.get("v") or 0) * price
+        movers.append({
+            "coin": coin,
+            "symbol": sym,
+            "price": price,
+            "change_pct_24h": change,
+            "volume_usd_24h": vol_usd,
+        })
+        if len(movers) >= limit:
+            break
+
+    return movers
+
+
+def massive_get_aggregates(coin: str, multiplier: int = 1,
+                           timespan: str = "hour",
+                           limit: int = 24) -> List[Dict]:
+    """
+    OHLCV bars for a coin from Massive.
+    timespan: minute | hour | day | week | month
+    Returns list of {t (ms), o, h, l, c, v} sorted newest-first.
+    """
+    sym = _MASSIVE_SYMBOLS.get(coin.upper())
+    if not sym:
+        return []
+
+    now = datetime.now(timezone.utc)
+    if timespan == "minute":
+        from_dt = now - timedelta(hours=24)
+    elif timespan == "hour":
+        from_dt = now - timedelta(days=3)
+    elif timespan == "day":
+        from_dt = now - timedelta(days=90)
+    else:
+        from_dt = now - timedelta(days=365)
+
+    from_str = from_dt.strftime("%Y-%m-%d")
+    to_str = now.strftime("%Y-%m-%d")
+
+    data = _massive_request(
+        f"/v2/aggs/ticker/{sym}/range/{multiplier}/{timespan}/{from_str}/{to_str}",
+        params={"limit": min(limit, 5000), "sort": "desc"}
+    )
+    if not data or data.get("status") != "OK":
+        return []
+
+    return data.get("results") or []
+
+
+def massive_get_recent_trades(coin: str,
+                              threshold_usd: float = 500_000,
+                              max_results: int = 20) -> List[Dict]:
+    """
+    Recent large crypto trades (whale activity).
+    Filters by USD size threshold.
+    """
+    sym = _MASSIVE_SYMBOLS.get(coin.upper())
+    if not sym:
+        return []
+
+    data = _massive_request(
+        f"/v3/trades/{sym}",
+        params={"limit": 1000, "order": "desc"}
+    )
+    if not data:
+        return []
+
+    big_trades = []
+    for t in (data.get("results") or []):
+        size = float(t.get("size") or 0)
+        price = float(t.get("price") or 0)
+        usd_value = size * price
+        if usd_value >= threshold_usd:
+            big_trades.append({
+                "size": size,
+                "price": price,
+                "usd_value": usd_value,
+                "exchange_id": t.get("exchange", "?"),
+                "timestamp": t.get("participant_timestamp") or
+                             t.get("sip_timestamp", 0),
+                "conditions": t.get("conditions", []),
+            })
+            if len(big_trades) >= max_results:
+                break
+
+    return big_trades
+
+
 # ── Binance Market Data ──
 BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr"
 
@@ -886,9 +1093,18 @@ _BINANCE_SYMBOLS = {
 
 def get_market_context(coin: str) -> Optional[Dict]:
     """
-    Fetch real-time price + 24h stats from Binance.
-    Returns: {price, high_24h, low_24h, change_pct_24h, volume_usd_24h} or None
+    Fetch real-time price + 24h stats.
+    Priority order:
+      1. Massive.com (institutional, cross-exchange) — if POLYGON_API_KEY set
+      2. Binance (free, single-exchange) — automatic fallback
     """
+    # Try Massive first (more accurate cross-exchange data)
+    if POLYGON_API_KEY:
+        ctx = massive_get_snapshot(coin)
+        if ctx:
+            return ctx
+
+    # Fallback to Binance (free, no key needed)
     symbol = _BINANCE_SYMBOLS.get(coin.upper())
     if not symbol:
         return None
@@ -917,6 +1133,7 @@ def get_market_context(coin: str) -> Optional[Dict]:
             "low_24h": low,
             "change_pct_24h": change_pct,
             "volume_usd_24h": volume_usd,
+            "source": "Binance",
         }
     except Exception as e:
         log.debug(f"[MARKET] {coin} fetch failed: {e}")
@@ -938,7 +1155,10 @@ def format_market_context_for_prompt(contexts: List[Dict]) -> str:
     if not contexts:
         return "No market data available."
 
-    lines = ["REAL-TIME MARKET DATA (from Binance, NOW):"]
+    # Detect primary source for header
+    sources = set(c.get("source", "Binance") for c in contexts)
+    src_label = "Massive (cross-exchange)" if "Massive" in sources else "Binance"
+    lines = [f"REAL-TIME MARKET DATA (from {src_label}, NOW):"]
     for ctx in contexts:
         coin = ctx["coin"]
         price = ctx["price"]
@@ -2104,6 +2324,34 @@ def run_connectivity_test() -> Dict[str, Any]:
     storage_ok = storage_save("_health_check.json", {"ts": now_iso()})
     results["Storage"] = {"ok": storage_ok, "path": DATA_DIR}
 
+    # Massive.com (Polygon.io) — institutional market data
+    if POLYGON_API_KEY:
+        start = time.time()
+        try:
+            snap = massive_get_snapshot("BTC")
+            elapsed = int((time.time() - start) * 1000)
+            if snap:
+                results["Massive"] = {
+                    "ok": True,
+                    "elapsed_ms": elapsed,
+                    "btc_price": snap.get("price", 0),
+                    "source": snap.get("source", "?"),
+                }
+            else:
+                results["Massive"] = {
+                    "ok": False,
+                    "error": "no data (check key/subscription)",
+                    "elapsed_ms": elapsed,
+                }
+        except Exception as e:
+            results["Massive"] = {"ok": False, "error": str(e)[:80]}
+    else:
+        results["Massive"] = {
+            "ok": False,
+            "error": "POLYGON_API_KEY missing",
+            "skipped": True,
+        }
+
     # Portfolio link
     portfolio_coins = get_portfolio_coins()
     results["Portfolio"] = {
@@ -2233,26 +2481,22 @@ async def daily_digest_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "📰 *NEWS CRYPTO BOT v2.1*\n"
-        "_Smart Crypto News + AI Council_\n\n"
+        "📰 *NEWS CRYPTO BOT v2.2*\n"
+        "_News + AI Council + Massive Market Data_\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "*🤝 Council of 3 AI Experts:*\n"
         "🟢 Gemini — العين السريعة\n"
         "🟣 Claude — المحلل الاستراتيجي\n"
         "🔵 GPT-4o — صوت السوق\n\n"
+        "*💎 Market Data:*\n"
+        "Massive (cross-exchange) → Binance fallback\n\n"
         "*المصادر (8 RSS + 2 APIs):*\n"
         "📡 CoinDesk + The Block + CoinTelegraph\n"
         "📡 Decrypt + Bitcoin Magazine + Crypto Briefing\n"
         "📡 U.Today + Bitcoinist + CoinGecko + CryptoPanic\n\n"
-        "*الميزات:*\n"
-        "🤖 تحليل ذكي بـ 3 خبراء AI\n"
-        "💼 ربط مع محفظتك من DCA BOT\n"
-        "🔔 تنبيهات فورية للأخبار العاجلة\n"
-        "📊 Sentiment overview لكل عملة\n"
-        "📅 ملخص يومي تلقائي\n\n"
-        "*الأوامر:*\n"
+        "*أوامر الأخبار:*\n"
         "`/start`           القائمة\n"
-        "`/test`            فحص شامل + Council\n"
+        "`/test`            فحص شامل + Council + Massive\n"
         "`/news`            آخر الأخبار\n"
         "`/news BTC`        أخبار عملة معينة\n"
         "`/breaking`        الأخبار العاجلة\n"
@@ -2262,6 +2506,11 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "`/digest`          ملخص يومي الآن\n"
         "`/sources`         حالة المصادر\n"
         "`/monitor`         تشغيل/إيقاف التنبيهات\n\n"
+        "*💎 أوامر السوق (Massive):*\n"
+        "`/price BTC`       سعر فوري ⚡\n"
+        "`/price BTC ETH`   أسعار متعددة\n"
+        "`/movers`          🔥 أكبر صاعدين/هابطين\n"
+        "`/scan BTC`        🎯 مسح كامل: سعر+شموع+حيتان+أخبار\n\n"
         "*أنواع التنبيهات:*\n"
         "🚨🚨 Council تنبيه (high + portfolio)\n"
         "🚨 خبر عاجل (high impact)\n"
@@ -2468,7 +2717,7 @@ Respond with: {"sentiment": "bullish", "impact": "high"}"""
 
 
 async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    msg = await u.message.reply_text("⏳ فحص شامل (5 مصادر + Gemini)...")
+    msg = await u.message.reply_text("⏳ فحص شامل (Sources + Council + Massive)...")
     loop = asyncio.get_event_loop()
     results = await loop.run_in_executor(None, run_connectivity_test)
 
@@ -2530,6 +2779,16 @@ async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
     s = results.get("Storage", {})
     icon = "✅" if s.get("ok") else "❌"
     lines.append(f"{icon} Storage: `{s.get('path','?')}`")
+
+    # Massive.com market data
+    m = results.get("Massive", {})
+    if m.get("skipped"):
+        lines.append(f"💎 Massive: ⚪ _مفتاح غير موجود_")
+    elif m.get("ok"):
+        btc_p = m.get("btc_price", 0)
+        lines.append(f"💎 Massive: ✅ {m.get('elapsed_ms', 0)}ms · BTC=${btc_p:,.0f}")
+    else:
+        lines.append(f"💎 Massive: ❌ _{m.get('error','?')[:50]}_")
 
     p = results.get("Portfolio", {})
     if p.get("ok"):
@@ -2888,6 +3147,20 @@ async def cmd_sources(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     lines.append("")
     lines.append(f"📊 إجمالي: {len(articles)} خبر")
+
+    # Massive.com market data status
+    if POLYGON_API_KEY:
+        lines.append("")
+        lines.append("*💎 Market Data (Massive):*")
+        snap = massive_get_snapshot("BTC")
+        if snap:
+            lines.append(f"✅ Massive متصل (BTC=${snap.get('price', 0):,.0f})")
+        else:
+            lines.append("❌ Massive غير متصل (تحقق من المفتاح/الاشتراك)")
+    else:
+        lines.append("")
+        lines.append("⚪ Massive: مفتاح `POLYGON_API_KEY` غير موجود")
+
     last_update = snapshot.get("timestamp", "")
     if last_update:
         try:
@@ -2970,6 +3243,301 @@ async def cmd_monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ══════════════════════════════════════════════════════════════════
+# 11.5 MASSIVE.COM COMMANDS — Price / Movers / Scan
+# ══════════════════════════════════════════════════════════════════
+
+def _format_price(p: float) -> str:
+    """Smart price formatting based on magnitude."""
+    if p >= 100:
+        return f"${p:,.2f}"
+    elif p >= 1:
+        return f"${p:.4f}"
+    elif p >= 0.01:
+        return f"${p:.6f}"
+    else:
+        return f"${p:.8f}"
+
+
+def _format_usd(v: float) -> str:
+    """Format USD value compactly: K/M/B."""
+    if v >= 1_000_000_000:
+        return f"${v/1_000_000_000:.2f}B"
+    if v >= 1_000_000:
+        return f"${v/1_000_000:.2f}M"
+    if v >= 1_000:
+        return f"${v/1_000:.1f}K"
+    return f"${v:.0f}"
+
+
+async def cmd_price(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """
+    Real-time price for one or more coins.
+    Usage: /price BTC | /price BTC ETH SOL
+    """
+    if not c.args:
+        await u.message.reply_text(
+            "💰 *السعر الفوري*\n\n"
+            "استخدام:\n"
+            "`/price BTC` — سعر عملة واحدة\n"
+            "`/price BTC ETH SOL` — أسعار متعددة\n\n"
+            "_المصدر: Massive (إن كان متاحاً) أو Binance_",
+            parse_mode="Markdown"
+        )
+        return
+
+    msg = await u.message.reply_text("⏳ جاري جلب الأسعار...")
+    coins = [arg.upper() for arg in c.args[:10]]
+    loop = asyncio.get_event_loop()
+    contexts = await loop.run_in_executor(
+        None, get_market_context_multi, coins, len(coins)
+    )
+
+    if not contexts:
+        await msg.delete()
+        await u.message.reply_text(
+            "⚠️ لم يتم العثور على بيانات لأي من العملات المطلوبة"
+        )
+        return
+
+    found_coins = {ctx["coin"] for ctx in contexts}
+    missing = [c for c in coins if c not in found_coins]
+
+    lines = [
+        "💰 *أسعار فورية*",
+        f"🕐 {now_str()}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        ""
+    ]
+
+    for ctx in contexts:
+        coin = ctx["coin"]
+        price = ctx["price"]
+        change = ctx["change_pct_24h"]
+        high = ctx["high_24h"]
+        low = ctx["low_24h"]
+        vol_usd = ctx["volume_usd_24h"]
+        source = ctx.get("source", "?")
+
+        change_emoji = "📈" if change >= 0 else "📉"
+        change_sign = "+" if change >= 0 else ""
+
+        lines.append(f"{change_emoji} *{coin}* — {_format_price(price)}")
+        lines.append(
+            f"   24h: {change_sign}{change:.2f}% | "
+            f"حجم: {_format_usd(vol_usd)}"
+        )
+        lines.append(
+            f"   نطاق: {_format_price(low)} ↔ {_format_price(high)}"
+        )
+        lines.append(f"   _مصدر: {source}_")
+        lines.append("")
+
+    if missing:
+        lines.append(f"⚪ غير مدعومة: {', '.join(missing)}")
+
+    await msg.delete()
+    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_movers(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """
+    Top 10 gainers + top 10 losers across the entire crypto market.
+    Massive-only feature (cross-exchange aggregation).
+    """
+    if not POLYGON_API_KEY:
+        await u.message.reply_text(
+            "⚠️ هذا الأمر يحتاج `POLYGON_API_KEY`\n\n"
+            "اشترك في Massive Currencies Starter:\n"
+            "https://massive.com/dashboard/subscriptions\n\n"
+            "ثم أضف المفتاح في Railway → Variables:\n"
+            "`POLYGON_API_KEY = your_key`",
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+        return
+
+    msg = await u.message.reply_text("⏳ مسح أكبر متحركي السوق...")
+    loop = asyncio.get_event_loop()
+
+    gainers = await loop.run_in_executor(
+        None, massive_get_top_movers, "gainers", 10
+    )
+    losers = await loop.run_in_executor(
+        None, massive_get_top_movers, "losers", 10
+    )
+
+    if not gainers and not losers:
+        await msg.delete()
+        await u.message.reply_text(
+            "⚠️ تعذّر جلب البيانات من Massive\n"
+            "تحقق من: المفتاح + الاشتراك + الاتصال"
+        )
+        return
+
+    lines = [
+        "🔥 *Top Movers — 24h*",
+        f"🕐 {now_str()}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "📈 *أكبر 10 صاعدين:*"
+    ]
+    for i, m in enumerate(gainers[:10], 1):
+        coin = m["coin"]
+        change = m["change_pct_24h"]
+        price = m["price"]
+        lines.append(
+            f"{i}. {coin}: +{change:.1f}% | {_format_price(price)}"
+        )
+
+    lines.append("")
+    lines.append("📉 *أكبر 10 هابطين:*")
+    for i, m in enumerate(losers[:10], 1):
+        coin = m["coin"]
+        change = m["change_pct_24h"]
+        price = m["price"]
+        lines.append(
+            f"{i}. {coin}: {change:.1f}% | {_format_price(price)}"
+        )
+
+    lines.append("")
+    lines.append("_المصدر: Massive (cross-exchange aggregated)_")
+
+    await msg.delete()
+    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_scan(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """
+    Full institutional scan: price + chart + whale trades + news.
+    Combines Massive data with the bot's news pipeline.
+    """
+    if not c.args:
+        await u.message.reply_text(
+            "🎯 *مسح كامل لعملة*\n\n"
+            "استخدام: `/scan BTC`\n\n"
+            "يجمع: السعر + شموع آخر 24h + صفقات الحيتان + آخر الأخبار",
+            parse_mode="Markdown"
+        )
+        return
+
+    coin = c.args[0].upper()
+    msg = await u.message.reply_text(f"⏳ مسح كامل لـ {coin}...")
+    loop = asyncio.get_event_loop()
+
+    # Price (always available — Massive or Binance)
+    ctx = await loop.run_in_executor(None, get_market_context, coin)
+
+    if not ctx:
+        await msg.delete()
+        await u.message.reply_text(
+            f"⚠️ {coin} غير مدعوم أو لا توجد بيانات"
+        )
+        return
+
+    # Massive-only features
+    bars = []
+    trades = []
+    if POLYGON_API_KEY:
+        bars = await loop.run_in_executor(
+            None, massive_get_aggregates, coin, 1, "hour", 24
+        )
+        trades = await loop.run_in_executor(
+            None, massive_get_recent_trades, coin, 500_000, 5
+        )
+
+    # News (from existing pipeline cache)
+    snapshot = storage_load("news_latest.json", {})
+    articles = snapshot.get("articles", [])
+    coin_articles = [
+        a for a in articles
+        if coin in (a.get("coins") or [])
+    ][:3]
+
+    # Build response
+    lines = [
+        f"🎯 *مسح كامل: {coin}*",
+        f"🕐 {now_str()}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        ""
+    ]
+
+    # Price section
+    price = ctx["price"]
+    change = ctx["change_pct_24h"]
+    high = ctx["high_24h"]
+    low = ctx["low_24h"]
+    vol_usd = ctx["volume_usd_24h"]
+    src = ctx.get("source", "?")
+
+    change_sign = "+" if change >= 0 else ""
+    lines.append(f"💰 *السعر:* {_format_price(price)} ({change_sign}{change:.2f}%)")
+    lines.append(f"📊 24h Range: {_format_price(low)} → {_format_price(high)}")
+    lines.append(f"💧 الحجم: {_format_usd(vol_usd)}")
+    lines.append(f"_مصدر السعر: {src}_")
+    lines.append("")
+
+    # Hourly bars analysis
+    if bars:
+        closes = [float(b.get("c", 0)) for b in bars if b.get("c")]
+        if closes:
+            highest = max(closes)
+            lowest = min(closes)
+            current = closes[0]
+            if highest > lowest:
+                pos_pct = ((current - lowest) / (highest - lowest)) * 100
+            else:
+                pos_pct = 50
+            lines.append("📈 *آخر 24h (hourly bars من Massive):*")
+            lines.append(f"   High: {_format_price(highest)}")
+            lines.append(f"   Low:  {_format_price(lowest)}")
+            lines.append(f"   موقع السعر: {pos_pct:.0f}% من النطاق")
+            if pos_pct >= 80:
+                lines.append("   ⚠️ قريب جداً من القمة")
+            elif pos_pct <= 20:
+                lines.append("   ⚠️ قريب جداً من القاع")
+            lines.append("")
+
+    # Whale trades
+    if trades:
+        lines.append("🐋 *آخر صفقات كبيرة (>$500K):*")
+        for t in trades[:5]:
+            usd = t["usd_value"]
+            lines.append(
+                f"   • {_format_usd(usd)} @ {_format_price(t['price'])}"
+            )
+        lines.append("")
+    elif POLYGON_API_KEY:
+        lines.append("🐋 _لا توجد صفقات > $500K مؤخراً_")
+        lines.append("")
+
+    # Recent news with sentiment
+    if coin_articles:
+        lines.append(f"📰 *آخر أخبار {coin}:*")
+        for a in coin_articles[:3]:
+            title = (a.get("title") or "")[:75]
+            ai = a.get("ai") or {}
+            sent = ai.get("sentiment", "neutral")
+            sent_emoji = {
+                "bullish": "🟢", "bearish": "🔴", "neutral": "⚪"
+            }.get(sent, "⚪")
+            lines.append(f"   {sent_emoji} {title}")
+        lines.append("")
+    else:
+        lines.append(f"📰 _لا توجد أخبار حديثة عن {coin}_")
+        lines.append("")
+
+    if not POLYGON_API_KEY:
+        lines.append("💡 _لتفعيل شموع Massive وصفقات الحيتان:_")
+        lines.append("_أضف_ `POLYGON_API_KEY` _في Railway_")
+        lines.append("")
+
+    lines.append("_تحليل آلي — ليس نصيحة مالية_")
+
+    await msg.delete()
+    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or not u.message.text:
         return
@@ -2984,6 +3552,23 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if text in ("ملخص", "digest", "summary"):
         await cmd_digest(u, c)
         return
+    if text in ("متحركين", "movers", "صاعدين", "هابطين"):
+        await cmd_movers(u, c)
+        return
+    # Free-form: "سعر BTC" / "price BTC"
+    if text.startswith("سعر ") or text.startswith("price "):
+        parts = u.message.text.strip().split()
+        if len(parts) >= 2:
+            c.args = parts[1:]
+            await cmd_price(u, c)
+            return
+    # Free-form: "مسح BTC" / "scan BTC"
+    if text.startswith("مسح ") or text.startswith("scan "):
+        parts = u.message.text.strip().split()
+        if len(parts) >= 2:
+            c.args = parts[1:]
+            await cmd_scan(u, c)
+            return
 
     await u.message.reply_text(
         "🤖 لم أفهم الأمر.\n\nأرسل `/start` لرؤية الأوامر.",
@@ -3019,14 +3604,17 @@ def _print_banner():
     cl_status = "✅" if CLAUDE_API_KEY else "⚪"
     oa_status = "✅" if OPENAI_API_KEY else "⚪"
     cp_status = "✅" if CRYPTOPANIC_KEY else "⚪ public mode"
+    mv_status = "✅" if POLYGON_API_KEY else "⚪ Binance fallback"
 
     print("=" * 70)
-    print("  📰 NEWS_CRYPTO_BOT v2.1 — Smart News + AI Council ✅")
+    print("  📰 NEWS_CRYPTO_BOT v2.2 — News + Council + Massive ✅")
     print("=" * 70)
     print(f"  🤝 Council of AI Experts:")
     print(f"    🟢 Gemini      : {gem_status}  ({GEMINI_MODEL})")
     print(f"    🟣 Claude      : {cl_status}  ({CLAUDE_MODEL})")
     print(f"    🔵 OpenAI      : {oa_status}  ({OPENAI_MODEL})")
+    print(f"  💎 Market Data:")
+    print(f"    💎 Massive     : {mv_status}")
     print(f"  المصادر         :")
     print(f"    📡 CoinDesk        : RSS")
     print(f"    📡 The Block       : RSS")
@@ -3074,6 +3662,10 @@ def main():
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("sources", cmd_sources))
     app.add_handler(CommandHandler("monitor", cmd_monitor))
+    # Massive.com market data commands (v2.2)
+    app.add_handler(CommandHandler("price", cmd_price))
+    app.add_handler(CommandHandler("movers", cmd_movers))
+    app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, handle_msg
     ))
